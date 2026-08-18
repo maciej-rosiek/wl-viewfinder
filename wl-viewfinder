@@ -257,7 +257,8 @@ set_region() {
     # portal request that asks only for windows with nothing to answer. The frame is BindsTo this
     # unit, so it does not come back by itself after a restart; re-aiming restores it.
     systemd-run --user --collect --quiet --unit="$mirror_unit" --setenv=PATH="$PATH" \
-      --property=Restart=on-failure --property=RestartSec=1 -- \
+      --property=Restart=on-failure --property=RestartSec=1 \
+      --property=ExecStartPost="$self_dir/wl-viewfinder park" -- \
       wl-present mirror "$output" -r "$region" --title "Shared region"
     if [ -n "$sink" ]; then
       park_mirror "$sink" ||
@@ -353,6 +354,17 @@ case "${1:-}" in
     stop_unit "$follow_unit"
     mkdir -p "$state"; : > "$target"
     set_region "$region" "$black"
+    ;;
+  park)
+    # Run as the mirror unit's ExecStartPost, so a mirror that came back on its own is parked like
+    # one this script started. A sway `for_window` rule looks like it should cover this and does
+    # not: the move does not fire at map time, so the window lands on whatever workspace is in
+    # front of you. Never fails -- a failing ExecStartPost would fail the unit, and the unit
+    # restarts on failure.
+    if sink_enabled; then
+      name=$(sink_name)
+      [ -z "$name" ] || park_mirror "$name" || true
+    fi
     ;;
   follow) follow ;;
   off)

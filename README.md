@@ -54,12 +54,6 @@ window, it has a fixed size: re-aiming the rectangle never renegotiates the stre
 issues a restore token for it without the patches a window target needs. `wl-viewfinder off`
 unplugs it again.
 
-Add this so the mirror lands there without flashing across your workspace first:
-
-```
-for_window [app_id="at.yrlf.wl_mirror"] move container to workspace viewfinder, fullscreen enable
-```
-
 **Anywhere else,** or with `WL_VIEWFINDER_SINK=window`, the mirror is an ordinary window titled
 **"Shared region"** and that is what you hand over. It has to stay mapped and on a visible
 workspace: a window the compositor is not drawing produces no frames, and the share freezes.
