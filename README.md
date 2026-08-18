@@ -67,7 +67,7 @@ sudo make install          # PREFIX=/usr/local
 Nix:
 
 ```sh
-nix run github:mrosiek/wl-viewfinder -- window
+nix run github:maciej-rosiek/wl-viewfinder -- window
 ```
 
 or add the flake's `packages.default` to your system or home-manager packages.
