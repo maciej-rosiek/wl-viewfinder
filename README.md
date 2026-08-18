@@ -41,8 +41,10 @@ wl-viewfinder status   # units, region, followed window
 What you share depends on where the mirror was parked, and under sway it is parked out of sight.
 
 Start with `blank` and the call sees a black screen until you aim at something -- and going back
-to `blank` mid-call hides the room again without dropping the share, because the output being
-shared outlives the mirror on it.
+to `blank` mid-call hides the room again without dropping the share. Blanking points the mirror at
+a second, small headless output that is only ever black rather than stopping it, so the window and
+the sink both stay present: a portal request that asks only for windows still has something to be
+answered with, and nothing is renegotiated.
 
 **Under sway (the default).** The tool asks sway for a headless output -- a screen that renders and
 can be captured like any other, but that no display is showing -- and parks the mirror there
