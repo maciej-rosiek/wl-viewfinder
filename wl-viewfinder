@@ -25,6 +25,8 @@ state="${XDG_RUNTIME_DIR:-/tmp}/wl-viewfinder"
 fifo="$state/frame"
 target="$state/target"
 current="$state/current"
+sink_mode=${WL_VIEWFINDER_SINK_MODE:-1920x1080}
+sink_workspace=${WL_VIEWFINDER_SINK_WORKSPACE:-viewfinder}
 mirror_unit=wl-viewfinder-mirror
 frame_unit=wl-viewfinder-frame
 follow_unit=wl-viewfinder-follow
@@ -40,7 +42,9 @@ usage: wl-viewfinder <command>
   label    one line describing what is being shared
   status   the units, the region and the followed window
 
-Share the window titled "Shared region" with whatever you are calling from.
+Under sway the mirror is parked on a headless output, so nothing appears on your screen and
+the thing to share is that monitor rather than a window. WL_VIEWFINDER_SINK=window puts it back
+in an ordinary window; WL_VIEWFINDER_SINK_MODE sets the shared resolution (default 1920x1080).
 USAGE
   exit 1
 }
@@ -97,11 +101,71 @@ region_of_id() {
 
 focused_output() {
   swaymsg -t get_outputs | jq -r '
-    first(.[] | select(.focused)
+    first(.[] | select(.focused and (.name | startswith("HEADLESS-") | not))
       | "\(.name) \(.rect.x),\(.rect.y) \(.rect.width)x\(.rect.height)") // empty'
 }
 
 subscribe_window_events() { swaymsg -m -t subscribe '["window"]'; }
+
+# The mirror has to be a real window somewhere, but nothing says it has to be on a screen you are
+# looking at. sway can invent a headless output on demand: it renders and can be captured like any
+# other, while windows parked there never touch the layout of a physical display. Two consequences
+# beyond the obvious one. The share target becomes a monitor rather than a window, so it has a
+# stable name and a fixed size -- re-aiming the rectangle never renegotiates the stream. And the
+# output is positioned far away rather than beside the real ones, because sway hands the pointer
+# across a shared edge: an adjacent sink would swallow the cursor onto a screen nobody can see.
+sink_enabled() {
+  case "${WL_VIEWFINDER_SINK:-auto}" in
+    window) return 1 ;;
+    headless) return 0 ;;
+    *) have swaymsg && have jq ;;
+  esac
+}
+
+sink_name() {
+  swaymsg -t get_outputs |
+    jq -r 'first(.[] | select(.name | startswith("HEADLESS-")) | .name) // empty'
+}
+
+ensure_sink() {
+  local name ws
+  name=$(sink_name)
+  if [ -z "$name" ]; then
+    swaymsg create_output > /dev/null || return 1
+    name=$(sink_name)
+    [ -n "$name" ] || return 1
+    swaymsg "output $name mode $sink_mode" > /dev/null || true
+    swaymsg "output $name position 20000 20000" > /dev/null || true
+    # A new output is given the next free workspace number, which would eat one of the numbers the
+    # keyboard bindings expect. Renaming it also keeps it the output's active workspace, and only
+    # the active one is rendered -- a mirror parked on any other produces no frames at all.
+    ws=$(swaymsg -t get_workspaces | jq -r --arg o "$name" 'first(.[] | select(.output == $o) | .name) // empty')
+    [ -z "$ws" ] || [ "$ws" = "$sink_workspace" ] ||
+      swaymsg "rename workspace \"$ws\" to \"$sink_workspace\"" > /dev/null || true
+  fi
+  printf '%s\n' "$name"
+}
+
+park_mirror() {
+  local name=$1 id tries
+  for tries in 1 2 3 4 5 6 7 8 9 10; do
+    id=$(swaymsg -t get_tree | jq -r 'first(.. | objects | select(.app_id == "at.yrlf.wl_mirror") | .id) // empty')
+    [ -z "$id" ] || break
+    sleep 0.3
+  done
+  [ -n "$id" ] || return 1
+  # to output, not to a named workspace: this lands it on whichever workspace that output is
+  # showing, which is the only one that renders.
+  swaymsg "[con_id=$id] move container to output $name" > /dev/null || return 1
+  swaymsg "[con_id=$id] fullscreen enable" > /dev/null || true
+}
+
+drop_sink() {
+  local name
+  name=$(sink_name)
+  [ -n "$name" ] || return 0
+  swaymsg "output $name unplug" > /dev/null 2>&1 || true
+}
 
 # --- end compositor backend --------------------------------------------------------------------
 
@@ -138,8 +202,16 @@ set_region() {
   else
     # The output has to be positional: given only options, wl-present's mirror falls back to
     # asking through slurp, which is exactly the interactive step these bindings exist to avoid.
+    local sink=""
+    if sink_enabled; then
+      sink=$(ensure_sink) || sink=""
+    fi
     systemd-run --user --collect --quiet --unit="$mirror_unit" --setenv=PATH="$PATH" -- \
       wl-present mirror "$output" -r "$region" --title "Shared region"
+    if [ -n "$sink" ]; then
+      park_mirror "$sink" ||
+        echo "wl-viewfinder: could not park the mirror on $sink, it is on a real screen" >&2
+    fi
   fi
 
   printf '%s %s\n' "$output" "$region" > "$current"
@@ -223,6 +295,7 @@ case "${1:-}" in
     fi
     stop_unit "$frame_unit"
     rm -f "$fifo" "$target" "$current"
+    if sink_enabled; then drop_sink; fi
     ;;
   label)
     if unit_active "$mirror_unit" && [ -s "$current" ]; then

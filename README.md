@@ -37,8 +37,28 @@ wl-viewfinder label    # one line: what is being shared
 wl-viewfinder status   # units, region, followed window
 ```
 
-Then share the window titled **"Shared region"** with Slack, Chrome, Zoom or whatever you are
-calling from -- once, at the start of the call.
+What you share depends on where the mirror was parked, and under sway it is parked out of sight.
+
+**Under sway (the default).** The tool asks sway for a headless output -- a screen that renders and
+can be captured like any other, but that no display is showing -- and parks the mirror there
+fullscreen. Nothing appears on your own screen, and the thing to share is that **monitor**
+(`HEADLESS-n`), once at the start of the call. Because the share target is an output rather than a
+window, it has a fixed size: re-aiming the rectangle never renegotiates the stream, and the portal
+issues a restore token for it without the patches a window target needs. `wl-viewfinder off`
+unplugs it again.
+
+Add this so the mirror lands there without flashing across your workspace first:
+
+```
+for_window [app_id="at.yrlf.wl_mirror"] move container to workspace viewfinder, fullscreen enable
+```
+
+**Anywhere else,** or with `WL_VIEWFINDER_SINK=window`, the mirror is an ordinary window titled
+**"Shared region"** and that is what you hand over. It has to stay mapped and on a visible
+workspace: a window the compositor is not drawing produces no frames, and the share freezes.
+
+`WL_VIEWFINDER_SINK_MODE` sets the shared resolution (default `1920x1080`). Regions of a different
+aspect are letterboxed into it rather than resizing the stream mid-call.
 
 Sway bindings:
 
