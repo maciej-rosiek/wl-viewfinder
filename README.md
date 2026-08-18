@@ -75,14 +75,21 @@ at another window never shares it by accident.
 Note the rectangle is a screen region, not a window handle: it shows whatever is underneath it, so
 switching workspaces changes what is shared. The red frame is there to keep that honest.
 
+**The aim is given up when the call is.** The moment nothing is capturing any more -- you pressed
+"stop sharing", or the meeting ended -- the tool goes back to `blank` by itself: the follower stops
+and the red frame goes away, because a rectangle claiming a share that has ended is exactly the lie
+the frame exists to prevent. The mirror stays up, so joining the next call still costs one portal
+prompt. Needs `pw-dump`; without it the aim simply stays where you left it.
+
 ## Install
 
 | dependency | needed for |
 | --- | --- |
 | `wl-mirror` >= 0.18 (ships `wl-present`) | everything -- it is the engine |
-| a systemd user session | everything -- the three transient units |
+| a systemd user session | everything -- the four transient units |
 | `slurp` | `select`, and `output` when there is no sway |
 | `sway` + `jq` | `window` only |
+| `pw-dump` (pipewire) | giving up the aim when the call ends |
 
 Build needs a C compiler, `pkg-config`, `wayland-scanner` and `wayland-client` headers. The Wayland
 protocols are vendored, so `wayland-protocols` and `wlr-protocols` are not build dependencies.
@@ -109,11 +116,18 @@ wl-viewfinder window
       +-- wl-present mirror <output> -r <region>    (systemd user unit, the shared window)
       +-- wl-viewfinder-frame                        (layer-shell red frame, via a fifo)
       +-- wl-viewfinder follow                       (keeps the region on that window)
+      +-- wl-viewfinder watch                        (gives up the aim when the call ends)
 ```
 
-Three transient `systemd --user` units. The frame and the follower are `BindsTo` the mirror, so
-closing the mirror window tears down everything -- a red frame left on screen claiming a share that
-has ended would be worse than no frame at all.
+Four transient `systemd --user` units. The frame, the follower and the watcher are `BindsTo` the
+mirror, so closing the mirror window tears down everything -- a red frame left on screen claiming a
+share that has ended would be worse than no frame at all.
+
+The watcher answers "is anybody still capturing" from the PipeWire graph rather than from the
+portal, which offers no way to ask: `xdg-desktop-portal-wlr` gives each cast a node named
+`xdpw-stream-<random>` that lives exactly as long as the cast does, and `pw-dump -m` streams
+additions and removals of it. An empty graph is believed only after it has stayed empty for a
+second, because a client renegotiating drops its node and takes a new one straight away.
 
 Re-aiming feeds `wl-present set-region` on the running mirror. The mirror window itself never
 resizes, so PipeWire never renegotiates and the share survives.

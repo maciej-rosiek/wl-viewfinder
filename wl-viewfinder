@@ -31,6 +31,7 @@ blank_workspace=${WL_VIEWFINDER_SINK_WORKSPACE:-viewfinder}-blank
 mirror_unit=wl-viewfinder-mirror
 frame_unit=wl-viewfinder-frame
 follow_unit=wl-viewfinder-follow
+watch_unit=wl-viewfinder-watch
 
 usage() {
   cat >&2 <<'USAGE'
@@ -217,6 +218,19 @@ drop_sink() {
 
 # BindsTo the mirror so the frame cannot outlive what it is pointing at: closing the mirror
 # window ends the share, and a red rectangle still on screen would be claiming otherwise.
+# BindsTo the mirror for the same reason as the frame, and started from every aim rather than from
+# one command, so a share is disarmed the same way whichever command aimed it. Skipped where
+# pipewire is not on PATH: the watcher is the only part that needs it and a share without it works,
+# it just keeps its rectangle until the mirror is stopped by hand.
+start_watch() {
+  have pw-dump && have jq || return 0
+  unit_active "$watch_unit" ||
+    systemd-run --user --collect --quiet --unit="$watch_unit" --setenv=PATH="$PATH" \
+      --property=Restart=on-failure --property=RestartSec=2 \
+      --property=BindsTo="$mirror_unit.service" --property=After="$mirror_unit.service" \
+      -- wl-viewfinder watch
+}
+
 push_frame() {
   unit_active "$frame_unit" ||
     systemd-run --user --collect --quiet --unit="$frame_unit" --setenv=PATH="$PATH" \
@@ -268,6 +282,21 @@ set_region() {
 
   printf '%s %s\n' "$output" "$region" > "$current"
   push_frame "$output $region"
+  start_watch
+}
+
+# The mirror keeps running, aimed at a black output. That is what makes this the state to join a
+# call in and the way back out of one: the sink and the "Shared region" window both stay present,
+# so nothing is renegotiated and no portal request is left with nothing to answer.
+aim_blank() {
+  local black region
+  ensure_sink > /dev/null || { echo "wl-viewfinder: could not create the sink" >&2; return 1; }
+  black=$(ensure_blank) || { echo "wl-viewfinder: could not create the blank source" >&2; return 1; }
+  region=$(blank_region "$black")
+  [ -n "$region" ] || { echo "wl-viewfinder: the blank source has no geometry" >&2; return 1; }
+  stop_unit "$follow_unit"
+  mkdir -p "$state"; : > "$target"
+  set_region "$region" "$black"
 }
 
 # Keeps the rectangle on a window as it is resized, moved or sent to another output. Sway's window
@@ -297,6 +326,55 @@ follow() {
       seen=$region
     fi
   done
+}
+
+# Whether anything is capturing through the portal right now. xdg-desktop-portal-wlr calls its
+# pipewire node xdpw-stream-<random> and that node exists for exactly as long as the cast does, so
+# the graph answers "is somebody watching" -- the portal itself offers no way to ask.
+casting() {
+  pw-dump 2>/dev/null |
+    jq -e 'any(.[]; (.info.props["media.name"]? // "") | startswith("xdpw-stream-"))' > /dev/null
+}
+
+# Back to the state a call is joined in. The mirror stays up, so the next portal request still has
+# something to answer and nothing is renegotiated; only the aim is given up, which puts the frame
+# around the black output where nobody can see it.
+disarm() {
+  if sink_enabled; then
+    aim_blank
+  else
+    stop_unit "$follow_unit"
+    [ ! -p "$fifo" ] || printf 'off\n' | timeout 2 tee "$fifo" > /dev/null || true
+    stop_unit "$frame_unit"
+  fi
+}
+
+# Gives up the aim when the last cast ends, so a red rectangle cannot outlive the call it was
+# describing: what it claims is being shared stops being true the moment the meeting stops asking
+# for frames. pw-dump -m opens with the graph as it stands and then prints one object per change;
+# a removal arrives as an object with no info at all, which is why removals are matched against
+# the ids already seen rather than by name.
+watch_casts() {
+  local -A casts=()
+  local kind id
+  while read -r kind id; do
+    case "$kind" in
+      cast) casts[$id]=1 ;;
+      gone)
+        [ -n "${casts[$id]:-}" ] || continue
+        unset "casts[$id]"
+        [ "${#casts[@]}" -eq 0 ] || continue
+        # A client renegotiating drops its node and takes a new one straight away, so an empty
+        # graph is only believed once it has stayed empty.
+        sleep 1
+        ! casting || continue
+        disarm
+        ;;
+    esac
+  done < <(pw-dump -m 2>/dev/null | jq --unbuffered -r '
+    .[] | if .info == null then "gone \(.id)"
+          elif ((.info.props["media.name"]? // "") | startswith("xdpw-stream-")) then "cast \(.id)"
+          else empty end')
 }
 
 case "${1:-}" in
@@ -344,16 +422,7 @@ case "${1:-}" in
       echo "wl-viewfinder: blank needs the headless sink, which needs sway (swaymsg + jq)" >&2
       exit 1
     fi
-    # The mirror keeps running, aimed at a black output. That is what makes this the state to join
-    # a call in and the way back out of one: the sink and the "Shared region" window both stay
-    # present, so nothing is renegotiated and no portal request is left with nothing to answer.
-    ensure_sink > /dev/null || { echo "wl-viewfinder: could not create the sink" >&2; exit 1; }
-    black=$(ensure_blank) || { echo "wl-viewfinder: could not create the blank source" >&2; exit 1; }
-    region=$(blank_region "$black")
-    [ -n "$region" ] || { echo "wl-viewfinder: the blank source has no geometry" >&2; exit 1; }
-    stop_unit "$follow_unit"
-    mkdir -p "$state"; : > "$target"
-    set_region "$region" "$black"
+    aim_blank
     ;;
   park)
     # Run as the mirror unit's ExecStartPost, so a mirror that came back on its own is parked like
@@ -367,8 +436,10 @@ case "${1:-}" in
     fi
     ;;
   follow) follow ;;
+  watch) watch_casts ;;
   off)
     stop_unit "$follow_unit"
+    stop_unit "$watch_unit"
     stop_unit "$mirror_unit"
     if [ -p "$fifo" ]; then
       printf 'off\n' | timeout 2 tee "$fifo" > /dev/null || true
@@ -392,7 +463,7 @@ case "${1:-}" in
     fi
     ;;
   status)
-    for unit in "$mirror_unit" "$frame_unit" "$follow_unit"; do
+    for unit in "$mirror_unit" "$frame_unit" "$follow_unit" "$watch_unit"; do
       printf '%-24s %s\n' "$unit" "$(systemctl --user is-active "$unit.service" 2>/dev/null || true)"
     done
     if [ -s "$current" ]; then

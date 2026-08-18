@@ -5,6 +5,7 @@
 , wayland
 , makeWrapper
 , jq
+, pipewire
 , wl-mirror
 , slurp
 }:
@@ -25,7 +26,7 @@ stdenv.mkDerivation {
   # depending on it here would make every install build the compositor.
   postInstall = ''
     wrapProgram $out/bin/wl-viewfinder \
-      --prefix PATH : ${lib.makeBinPath [ jq wl-mirror slurp ]} \
+      --prefix PATH : ${lib.makeBinPath [ jq pipewire wl-mirror slurp ]} \
       --prefix PATH : $out/bin
   '';
 
