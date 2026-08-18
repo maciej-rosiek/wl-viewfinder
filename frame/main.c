@@ -23,14 +23,22 @@
 #include <wayland-client.h>
 
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
+#include "xdg-output-unstable-v1-client-protocol.h"
 
 #define MAX_OUTPUTS 16
 #define LINE_MAX_LEN 512
 
 struct output {
 	struct wl_output *wl_output;
+	struct zxdg_output_v1 *xdg_output;
 	char *name;
+	// Logical geometry, which is what callers speak and what layer-shell margins are measured in.
+	// wl_output only carries a rounded integer scale, so under fractional scaling its geometry is
+	// not the compositor's layout; xdg-output reports the layout directly. geometry is kept as the
+	// fallback for the rare compositor without xdg-output.
 	int32_t x, y;
+	int32_t logical_x, logical_y, logical_width, logical_height;
+	bool has_logical;
 };
 
 static struct {
@@ -38,6 +46,7 @@ static struct {
 	struct wl_compositor *compositor;
 	struct wl_shm *shm;
 	struct zwlr_layer_shell_v1 *layer_shell;
+	struct zxdg_output_manager_v1 *xdg_output_manager;
 
 	struct output outputs[MAX_OUTPUTS];
 	int output_count;
@@ -100,6 +109,44 @@ static void output_description(void *data, struct wl_output *output, const char 
 	(void)data; (void)output; (void)description;
 }
 
+static void xdg_output_logical_position(void *data, struct zxdg_output_v1 *xdg_output,
+		int32_t x, int32_t y) {
+	(void)xdg_output;
+	struct output *out = data;
+	out->logical_x = x;
+	out->logical_y = y;
+	out->has_logical = true;
+}
+
+static void xdg_output_logical_size(void *data, struct zxdg_output_v1 *xdg_output,
+		int32_t width, int32_t height) {
+	(void)xdg_output;
+	struct output *out = data;
+	out->logical_width = width;
+	out->logical_height = height;
+}
+
+static void xdg_output_done(void *data, struct zxdg_output_v1 *xdg_output) {
+	(void)data; (void)xdg_output;
+}
+
+static void xdg_output_name(void *data, struct zxdg_output_v1 *xdg_output, const char *name) {
+	(void)data; (void)xdg_output; (void)name;
+}
+
+static void xdg_output_description(void *data, struct zxdg_output_v1 *xdg_output,
+		const char *description) {
+	(void)data; (void)xdg_output; (void)description;
+}
+
+static const struct zxdg_output_v1_listener xdg_output_listener = {
+	.logical_position = xdg_output_logical_position,
+	.logical_size = xdg_output_logical_size,
+	.done = xdg_output_done,
+	.name = xdg_output_name,
+	.description = xdg_output_description,
+};
+
 static const struct wl_output_listener output_listener = {
 	.geometry = output_geometry,
 	.mode = output_mode,
@@ -116,6 +163,9 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
 		state.compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 4);
 	} else if (strcmp(interface, wl_shm_interface.name) == 0) {
 		state.shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+	} else if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
+		state.xdg_output_manager = wl_registry_bind(registry, name,
+			&zxdg_output_manager_v1_interface, 2);
 	} else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
 		state.layer_shell = wl_registry_bind(registry, name, &zwlr_layer_shell_v1_interface, 1);
 	} else if (strcmp(interface, wl_output_interface.name) == 0) {
@@ -250,8 +300,10 @@ static void show(const char *output_name, int x, int y, int width, int height) {
 		ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
 	zwlr_layer_surface_v1_set_size(state.layer_surface, outer_width, outer_height);
 	// A layer surface is placed relative to its own output, callers report global coordinates.
+	int32_t origin_x = out->has_logical ? out->logical_x : out->x;
+	int32_t origin_y = out->has_logical ? out->logical_y : out->y;
 	zwlr_layer_surface_v1_set_margin(state.layer_surface,
-		y - out->y - state.border, 0, 0, x - out->x - state.border);
+		y - origin_y - state.border, 0, 0, x - origin_x - state.border);
 	// -1 keeps the frame over bars and docks instead of being pushed out of their zone.
 	zwlr_layer_surface_v1_set_exclusive_zone(state.layer_surface, -1);
 	zwlr_layer_surface_v1_set_keyboard_interactivity(state.layer_surface,
@@ -273,7 +325,22 @@ static void handle_line(const char *line) {
 
 static void usage(void) {
 	fprintf(stderr, "usage: wl-viewfinder-frame [-f fifo] [-b border] [-c rrggbb]\n");
+	fprintf(stderr, "       wl-viewfinder-frame -l    list outputs as `name x,y wxh` and exit\n");
 	exit(1);
+}
+
+// The client is already connected to the compositor to draw, so it is also the one thing here that
+// can answer "which outputs are there, and where" without asking a window manager. That is what
+// keeps `select` from needing a compositor-specific IPC.
+static void list_outputs(void) {
+	for (int i = 0; i < state.output_count; i++) {
+		struct output *out = &state.outputs[i];
+		if (out->name == NULL || !out->has_logical) {
+			continue;
+		}
+		printf("%s %d,%d %dx%d\n", out->name, out->logical_x, out->logical_y,
+			out->logical_width, out->logical_height);
+	}
 }
 
 int main(int argc, char *argv[]) {
@@ -282,9 +349,13 @@ int main(int argc, char *argv[]) {
 	snprintf(fifo_path, sizeof(fifo_path), "%s/wl-viewfinder/frame",
 		runtime_dir != NULL ? runtime_dir : "/tmp");
 
+	bool list_only = false;
 	int opt;
-	while ((opt = getopt(argc, argv, "f:b:c:h")) != -1) {
+	while ((opt = getopt(argc, argv, "f:b:c:lh")) != -1) {
 		switch (opt) {
+		case 'l':
+			list_only = true;
+			break;
 		case 'f':
 			snprintf(fifo_path, sizeof(fifo_path), "%s", optarg);
 			break;
@@ -302,14 +373,6 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	// Opened read-write so the frame is always its own writer: every caller is a separate,
-	// short-lived writer, and without this the reader would see EOF each time one closed.
-	int fifo_fd = open(fifo_path, O_RDWR | O_CLOEXEC);
-	if (fifo_fd < 0) {
-		fprintf(stderr, "wl-viewfinder-frame: cannot open %s: %s\n", fifo_path, strerror(errno));
-		return 1;
-	}
-
 	state.display = wl_display_connect(NULL);
 	if (state.display == NULL) {
 		fprintf(stderr, "wl-viewfinder-frame: cannot connect to a wayland display\n");
@@ -319,10 +382,36 @@ int main(int argc, char *argv[]) {
 	struct wl_registry *registry = wl_display_get_registry(state.display);
 	wl_registry_add_listener(registry, &registry_listener, NULL);
 	wl_display_roundtrip(state.display);
+
+	// The manager and the outputs arrive in the same registry burst, so the xdg_output objects can
+	// only be made once that burst has been dispatched -- hence the second roundtrip for their
+	// events rather than one for everything.
+	if (state.xdg_output_manager != NULL) {
+		for (int i = 0; i < state.output_count; i++) {
+			struct output *out = &state.outputs[i];
+			out->xdg_output = zxdg_output_manager_v1_get_xdg_output(state.xdg_output_manager,
+				out->wl_output);
+			zxdg_output_v1_add_listener(out->xdg_output, &xdg_output_listener, out);
+		}
+	}
 	wl_display_roundtrip(state.display);
+
+	if (list_only) {
+		list_outputs();
+		wl_display_disconnect(state.display);
+		return 0;
+	}
 
 	if (state.compositor == NULL || state.shm == NULL || state.layer_shell == NULL) {
 		fprintf(stderr, "wl-viewfinder-frame: compositor does not support wlr-layer-shell\n");
+		return 1;
+	}
+
+	// Opened read-write so the frame is always its own writer: every caller is a separate,
+	// short-lived writer, and without this the reader would see EOF each time one closed.
+	int fifo_fd = open(fifo_path, O_RDWR | O_CLOEXEC);
+	if (fifo_fd < 0) {
+		fprintf(stderr, "wl-viewfinder-frame: cannot open %s: %s\n", fifo_path, strerror(errno));
 		return 1;
 	}
 

@@ -2,8 +2,9 @@
 
 Share a rectangle of your screen, aimed at a window and following it as it moves and resizes.
 
-Currently **sway only**. See [Porting](#porting) -- the compositor-specific part is four shell
-functions.
+`select` and `output` work on **any wlroots-based compositor**. `window` -- aim at the focused
+window and follow it -- additionally needs **sway**, because following a window is the one question
+no Wayland client can answer for itself. See [Porting](#porting).
 
 ## Why
 
@@ -55,9 +56,15 @@ switching workspaces changes what is shared. The red frame is there to keep that
 
 ## Install
 
-Dependencies: `wl-mirror` (>= 0.18, ships `wl-present`), `sway`, `jq`, `slurp` (for `select`), and
-a systemd user session. Build needs a C compiler, `pkg-config`, `wayland-scanner` and
-`wayland-client` headers.
+| dependency | needed for |
+| --- | --- |
+| `wl-mirror` >= 0.18 (ships `wl-present`) | everything -- it is the engine |
+| a systemd user session | everything -- the three transient units |
+| `slurp` | `select`, and `output` when there is no sway |
+| `sway` + `jq` | `window` only |
+
+Build needs a C compiler, `pkg-config`, `wayland-scanner` and `wayland-client` headers. The Wayland
+protocols are vendored, so `wayland-protocols` and `wlr-protocols` are not build dependencies.
 
 ```sh
 make
@@ -90,15 +97,16 @@ has ended would be worse than no frame at all.
 Re-aiming feeds `wl-present set-region` on the running mirror. The mirror window itself never
 resizes, so PipeWire never renegotiates and the share survives.
 
-`wl-viewfinder-frame` is a ~370-line wlroots-layer-shell client: overlay layer, empty input region
-so clicks fall through, and an shm buffer whose interior is transparent. It costs about 4 MB
-resident.
+`wl-viewfinder-frame` is a small wlroots-layer-shell client: overlay layer, empty input region so
+clicks fall through, and an shm buffer whose interior is transparent. It costs about 4 MB resident.
+It also answers `-l`, listing outputs as `name x,y wxh` from `xdg-output`; that is what lets the
+region-to-output lookup -- needed on every path -- work without asking a compositor.
 
 ## Porting
 
 Everything that knows this is sway lives between the `--- compositor backend` markers in
-`wl-viewfinder`: `focused_window`, `region_of_id`, `focused_output_region`, `output_at`, and
-`subscribe_window_events`. Regions are `x,y WxH` in compositor-global logical coordinates.
+`wl-viewfinder`: `focused_window`, `region_of_id`, `focused_output`, and `subscribe_window_events`.
+Only `window` calls them. Regions are `x,y WxH` in compositor-global logical coordinates.
 
 Anything with `wlr-layer-shell` and a capture protocol wl-mirror supports (`wlr-screencopy` or
 `ext-image-copy-capture-v1`) can work: niri, Hyprland, river, Wayfire, COSMIC, labwc. **GNOME and
@@ -109,7 +117,8 @@ compositors with a real geometry-changed event should drive it from events inste
 
 ## Known limitations
 
-- Only tested at `scale = 1`. Fractional scaling may misplace the frame -- reports welcome.
+- Only tested at `scale = 1`. Geometry comes from `xdg-output`'s logical coordinates, so fractional
+  scaling should be handled correctly, but nobody has checked -- reports welcome.
 - The rectangle shows whatever is under it, including a window you drag on top of the shared one.
 - No audio; this only concerns video.
 

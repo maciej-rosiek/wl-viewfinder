@@ -8,7 +8,7 @@ CFLAGS += $(shell pkg-config --cflags wayland-client)
 
 WAYLAND_SCANNER ?= $(shell pkg-config --variable=wayland_scanner wayland-scanner 2>/dev/null || echo wayland-scanner)
 
-PROTOCOLS := wlr-layer-shell-unstable-v1 xdg-shell
+PROTOCOLS := wlr-layer-shell-unstable-v1 xdg-output-unstable-v1 xdg-shell
 PROTO_HEADERS := $(PROTOCOLS:%=build/%-client-protocol.h)
 PROTO_SOURCES := $(PROTOCOLS:%=build/%-protocol.c)
 

@@ -14,6 +14,13 @@
 # and `window` keeps the rectangle glued to one window through the follower below.
 set -euo pipefail
 
+# Sibling binaries are resolved next to this script, and the same PATH is handed to the units
+# below. Without both, a unit is started by the service manager with *its* PATH and can silently
+# run a different installation's frame than the one that launched it.
+self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)
+PATH="$self_dir:$PATH"
+export PATH
+
 state="${XDG_RUNTIME_DIR:-/tmp}/wl-viewfinder"
 fifo="$state/frame"
 target="$state/target"
@@ -38,6 +45,8 @@ USAGE
   exit 1
 }
 
+have() { command -v "$1" > /dev/null; }
+
 require() {
   local missing=()
   for tool in "$@"; do
@@ -52,9 +61,26 @@ require() {
 unit_active() { systemctl --user --quiet is-active "$1.service" 2>/dev/null; }
 stop_unit() { systemctl --user stop "$1.service" 2>/dev/null || true; }
 
+# Which output holds a point. wl-viewfinder-frame is already a wayland client, so it can answer
+# this from xdg-output rather than from a compositor's IPC -- which is what keeps `select` and
+# `output` working without sway.
+output_at() {
+  local x=$1 y=$2 name origin size ox oy ow oh
+  while read -r name origin size; do
+    ox=${origin%%,*}; oy=${origin#*,}
+    ow=${size%%x*}; oh=${size#*x}
+    if [ "$x" -ge "$ox" ] && [ "$x" -lt "$((ox + ow))" ] &&
+       [ "$y" -ge "$oy" ] && [ "$y" -lt "$((oy + oh))" ]; then
+      printf '%s\n' "$name"
+      return
+    fi
+  done < <(wl-viewfinder-frame -l)
+}
+
 # --- compositor backend: sway ------------------------------------------------------------------
-# Everything that knows which compositor this is lives in these four functions and the event
-# subscription in follow(). A port to another compositor replaces exactly this much.
+# Everything that knows which compositor this is lives below, and only `window` needs it: following
+# a window as it moves is the one question no wayland client can answer for itself. A port to
+# another compositor replaces exactly this much.
 
 focused_window() {
   swaymsg -t get_tree | jq -r '
@@ -69,16 +95,10 @@ region_of_id() {
       | .rect | "\(.x),\(.y) \(.width)x\(.height)") // empty'
 }
 
-focused_output_region() {
+focused_output() {
   swaymsg -t get_outputs | jq -r '
-    first(.[] | select(.focused) | .rect | "\(.x),\(.y) \(.width)x\(.height)") // empty'
-}
-
-output_at() {
-  swaymsg -t get_outputs | jq -r --argjson x "$1" --argjson y "$2" '
-    first(.[] | select(.active
-      and .rect.x <= $x and $x < .rect.x + .rect.width
-      and .rect.y <= $y and $y < .rect.y + .rect.height) | .name) // empty'
+    first(.[] | select(.focused)
+      | "\(.name) \(.rect.x),\(.rect.y) \(.rect.width)x\(.rect.height)") // empty'
 }
 
 subscribe_window_events() { swaymsg -m -t subscribe '["window"]'; }
@@ -89,7 +109,7 @@ subscribe_window_events() { swaymsg -m -t subscribe '["window"]'; }
 # window ends the share, and a red rectangle still on screen would be claiming otherwise.
 push_frame() {
   unit_active "$frame_unit" ||
-    systemd-run --user --collect --quiet --unit="$frame_unit" \
+    systemd-run --user --collect --quiet --unit="$frame_unit" --setenv=PATH="$PATH" \
       --property=BindsTo="$mirror_unit.service" --property=After="$mirror_unit.service" \
       -- wl-viewfinder-frame
   printf '%s\n' "$1" | timeout 5 tee "$fifo" > /dev/null ||
@@ -97,12 +117,13 @@ push_frame() {
 }
 
 set_region() {
-  local region=$1 x y output previous
+  local region=$1 output=${2:-} x y previous
   x=${region%%,*}
   y=${region#*,}
   y=${y%% *}
 
-  output=$(output_at "$x" "$y")
+  # slurp reports "<unknown>" when it cannot name the output, so that answer is not trusted.
+  [ -n "$output" ] && [ "$output" != "<unknown>" ] || output=$(output_at "$x" "$y")
   [ -n "$output" ] || { echo "wl-viewfinder: no active output holds $region" >&2; return 1; }
 
   mkdir -p "$state"
@@ -117,7 +138,7 @@ set_region() {
   else
     # The output has to be positional: given only options, wl-present's mirror falls back to
     # asking through slurp, which is exactly the interactive step these bindings exist to avoid.
-    systemd-run --user --collect --quiet --unit="$mirror_unit" -- \
+    systemd-run --user --collect --quiet --unit="$mirror_unit" --setenv=PATH="$PATH" -- \
       wl-present mirror "$output" -r "$region" --title "Shared region"
   fi
 
@@ -156,31 +177,42 @@ follow() {
 
 case "${1:-}" in
   window)
-    require swaymsg jq wl-present wl-viewfinder-frame systemd-run
+    require wl-present wl-viewfinder-frame systemd-run
+    if ! have swaymsg || ! have jq; then
+      echo 'wl-viewfinder: window needs sway (swaymsg + jq); select works anywhere' >&2
+      exit 1
+    fi
     line=$(focused_window)
     [ -n "$line" ] || { echo "wl-viewfinder: no focused window" >&2; exit 1; }
     mkdir -p "$state"
     printf '%s\n' "${line%% *}" > "$target"
     set_region "${line#* }"
     unit_active "$follow_unit" ||
-      systemd-run --user --collect --quiet --unit="$follow_unit" \
+      systemd-run --user --collect --quiet --unit="$follow_unit" --setenv=PATH="$PATH" \
         --property=BindsTo="$mirror_unit.service" --property=After="$mirror_unit.service" \
         -- wl-viewfinder follow
     ;;
   select)
-    require swaymsg jq wl-present wl-viewfinder-frame systemd-run slurp
-    region=$(slurp -f '%x,%y %wx%h') || exit 0
+    require wl-present wl-viewfinder-frame systemd-run slurp
+    picked=$(slurp -f '%o %x,%y %wx%h') || exit 0
     stop_unit "$follow_unit"
     mkdir -p "$state"; : > "$target"
-    set_region "$region"
+    set_region "${picked#* }" "${picked%% *}"
     ;;
   output)
-    require swaymsg jq wl-present wl-viewfinder-frame systemd-run
-    region=$(focused_output_region)
-    [ -n "$region" ] || { echo "wl-viewfinder: no focused output" >&2; exit 1; }
+    require wl-present wl-viewfinder-frame systemd-run
+    # sway can name the focused output outright; without it, offering the outputs as slurp
+    # rectangles is the portable way to ask which one.
+    if have swaymsg && have jq; then
+      picked=$(focused_output)
+    else
+      require slurp
+      picked=$(slurp -o -r -f '%o %x,%y %wx%h') || exit 0
+    fi
+    [ -n "$picked" ] || { echo "wl-viewfinder: no focused output" >&2; exit 1; }
     stop_unit "$follow_unit"
     mkdir -p "$state"; : > "$target"
-    set_region "$region"
+    set_region "${picked#* }" "${picked%% *}"
     ;;
   follow) follow ;;
   off)
