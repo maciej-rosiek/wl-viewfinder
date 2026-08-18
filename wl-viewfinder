@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# wl-viewfinder: share a rectangle of your screen, aimed at a window and following it.
+#
+# wl-mirror shows a rectangle of an output in an ordinary window, and that window is what you hand
+# to Slack, Chrome or anything else. Going through a mirror window rather than sharing the real one
+# is what buys back the mouse cursor -- wlroots never paints cursors into toplevel captures
+# (wlroots#4037), but it does paint them into the output capture wl-mirror consumes, so the cursor
+# arrives as ordinary window content. It also means one portal prompt for the whole call: re-aiming
+# the rectangle never touches the portal and never resizes the mirror window, so PipeWire never
+# renegotiates and a live share survives being re-aimed.
+#
+# The rectangle is a screen region, not a window: it shows whatever is under it, so switching
+# workspaces changes what is shared. wl-viewfinder-frame draws the red frame that says where it is,
+# and `window` keeps the rectangle glued to one window through the follower below.
+set -euo pipefail
+
+state="${XDG_RUNTIME_DIR:-/tmp}/wl-viewfinder"
+fifo="$state/frame"
+target="$state/target"
+current="$state/current"
+mirror_unit=wl-viewfinder-mirror
+frame_unit=wl-viewfinder-frame
+follow_unit=wl-viewfinder-follow
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: wl-viewfinder <command>
+
+  window   aim at the focused window and follow it as it moves and resizes
+  select   drag out a region
+  output   the whole focused output
+  off      stop sharing, close the mirror and the frame
+  label    one line describing what is being shared
+  status   the units, the region and the followed window
+
+Share the window titled "Shared region" with whatever you are calling from.
+USAGE
+  exit 1
+}
+
+require() {
+  local missing=()
+  for tool in "$@"; do
+    command -v "$tool" > /dev/null || missing+=("$tool")
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    echo "wl-viewfinder: missing required tools: ${missing[*]}" >&2
+    exit 1
+  fi
+}
+
+unit_active() { systemctl --user --quiet is-active "$1.service" 2>/dev/null; }
+stop_unit() { systemctl --user stop "$1.service" 2>/dev/null || true; }
+
+# --- compositor backend: sway ------------------------------------------------------------------
+# Everything that knows which compositor this is lives in these four functions and the event
+# subscription in follow(). A port to another compositor replaces exactly this much.
+
+focused_window() {
+  swaymsg -t get_tree | jq -r '
+    first(.. | objects
+      | select(.focused == true and .foreign_toplevel_identifier != null)
+      | "\(.id) \(.rect.x),\(.rect.y) \(.rect.width)x\(.rect.height)") // empty'
+}
+
+region_of_id() {
+  swaymsg -t get_tree | jq -r --argjson id "$1" '
+    first(.. | objects | select(.id == $id)
+      | .rect | "\(.x),\(.y) \(.width)x\(.height)") // empty'
+}
+
+focused_output_region() {
+  swaymsg -t get_outputs | jq -r '
+    first(.[] | select(.focused) | .rect | "\(.x),\(.y) \(.width)x\(.height)") // empty'
+}
+
+output_at() {
+  swaymsg -t get_outputs | jq -r --argjson x "$1" --argjson y "$2" '
+    first(.[] | select(.active
+      and .rect.x <= $x and $x < .rect.x + .rect.width
+      and .rect.y <= $y and $y < .rect.y + .rect.height) | .name) // empty'
+}
+
+subscribe_window_events() { swaymsg -m -t subscribe '["window"]'; }
+
+# --- end compositor backend --------------------------------------------------------------------
+
+# BindsTo the mirror so the frame cannot outlive what it is pointing at: closing the mirror
+# window ends the share, and a red rectangle still on screen would be claiming otherwise.
+push_frame() {
+  unit_active "$frame_unit" ||
+    systemd-run --user --collect --quiet --unit="$frame_unit" \
+      --property=BindsTo="$mirror_unit.service" --property=After="$mirror_unit.service" \
+      -- wl-viewfinder-frame
+  printf '%s\n' "$1" | timeout 5 tee "$fifo" > /dev/null ||
+    echo "wl-viewfinder: frame did not take the region" >&2
+}
+
+set_region() {
+  local region=$1 x y output previous
+  x=${region%%,*}
+  y=${region#*,}
+  y=${y%% *}
+
+  output=$(output_at "$x" "$y")
+  [ -n "$output" ] || { echo "wl-viewfinder: no active output holds $region" >&2; return 1; }
+
+  mkdir -p "$state"
+  [ -p "$fifo" ] || { rm -f "$fifo"; mkfifo "$fifo"; }
+
+  if unit_active "$mirror_unit"; then
+    # wl-mirror's region is relative to the output it was started on, so a window dragged to
+    # another screen needs the output moved first or the rectangle lands in empty space.
+    previous=$(cut -d' ' -f1 "$current" 2>/dev/null || true)
+    [ "$output" = "$previous" ] || wl-present set-output "$output"
+    wl-present set-region "$region"
+  else
+    # The output has to be positional: given only options, wl-present's mirror falls back to
+    # asking through slurp, which is exactly the interactive step these bindings exist to avoid.
+    systemd-run --user --collect --quiet --unit="$mirror_unit" -- \
+      wl-present mirror "$output" -r "$region" --title "Shared region"
+  fi
+
+  printf '%s %s\n' "$output" "$region" > "$current"
+  push_frame "$output $region"
+}
+
+# Keeps the rectangle on a window as it is resized, moved or sent to another output. Sway's window
+# event carries no resize change -- retiling siblings moves their edges without announcing it at
+# all -- so the events only make the common cases instant and the read timeout is what actually
+# catches a resize. Milliseconds per poll, and only while a share is aimed at a window.
+follow() {
+  local id region seen
+  seen=$(cut -d' ' -f2- "$current" 2>/dev/null || true)
+  exec 3< <(subscribe_window_events)
+  while :; do
+    read -r -t 0.3 _ <&3 || { [ $? -gt 128 ] || break; }
+
+    id=$(cat "$target" 2>/dev/null) || break
+    [ -n "$id" ] || break
+
+    region=$(region_of_id "$id")
+    if [ -z "$region" ]; then
+      # The window is gone. The rectangle stays where it is rather than following something else,
+      # and the frame keeps saying what is still being shared.
+      : > "$target"
+      break
+    fi
+
+    if [ "$region" != "$seen" ]; then
+      set_region "$region" || break
+      seen=$region
+    fi
+  done
+}
+
+case "${1:-}" in
+  window)
+    require swaymsg jq wl-present wl-viewfinder-frame systemd-run
+    line=$(focused_window)
+    [ -n "$line" ] || { echo "wl-viewfinder: no focused window" >&2; exit 1; }
+    mkdir -p "$state"
+    printf '%s\n' "${line%% *}" > "$target"
+    set_region "${line#* }"
+    unit_active "$follow_unit" ||
+      systemd-run --user --collect --quiet --unit="$follow_unit" \
+        --property=BindsTo="$mirror_unit.service" --property=After="$mirror_unit.service" \
+        -- wl-viewfinder follow
+    ;;
+  select)
+    require swaymsg jq wl-present wl-viewfinder-frame systemd-run slurp
+    region=$(slurp -f '%x,%y %wx%h') || exit 0
+    stop_unit "$follow_unit"
+    mkdir -p "$state"; : > "$target"
+    set_region "$region"
+    ;;
+  output)
+    require swaymsg jq wl-present wl-viewfinder-frame systemd-run
+    region=$(focused_output_region)
+    [ -n "$region" ] || { echo "wl-viewfinder: no focused output" >&2; exit 1; }
+    stop_unit "$follow_unit"
+    mkdir -p "$state"; : > "$target"
+    set_region "$region"
+    ;;
+  follow) follow ;;
+  off)
+    stop_unit "$follow_unit"
+    stop_unit "$mirror_unit"
+    if [ -p "$fifo" ]; then
+      printf 'off\n' | timeout 2 tee "$fifo" > /dev/null || true
+    fi
+    stop_unit "$frame_unit"
+    rm -f "$fifo" "$target" "$current"
+    ;;
+  label)
+    if unit_active "$mirror_unit" && [ -s "$current" ]; then
+      read -r output region < "$current"
+      printf 'Sharing %s on %s\n' "${region#* }" "$output"
+    else
+      printf 'Not sharing\n'
+    fi
+    ;;
+  status)
+    for unit in "$mirror_unit" "$frame_unit" "$follow_unit"; do
+      printf '%-24s %s\n' "$unit" "$(systemctl --user is-active "$unit.service" 2>/dev/null || true)"
+    done
+    if [ -s "$current" ]; then
+      printf '%-24s %s\n' "region" "$(cat "$current")"
+    fi
+    if [ -s "$target" ]; then
+      printf '%-24s %s\n' "following con" "$(cat "$target")"
+    fi
+    ;;
+  *) usage ;;
+esac
