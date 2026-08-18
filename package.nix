@@ -7,7 +7,6 @@
 , jq
 , wl-mirror
 , slurp
-, sway
 }:
 
 stdenv.mkDerivation {
@@ -22,9 +21,11 @@ stdenv.mkDerivation {
 
   makeFlags = [ "PREFIX=$(out)" ];
 
+  # swaymsg is deliberately not wrapped in: anyone running this already has sway on PATH, and
+  # depending on it here would make every install build the compositor.
   postInstall = ''
     wrapProgram $out/bin/wl-viewfinder \
-      --prefix PATH : ${lib.makeBinPath [ jq wl-mirror slurp sway ]} \
+      --prefix PATH : ${lib.makeBinPath [ jq wl-mirror slurp ]} \
       --prefix PATH : $out/bin
   '';
 
