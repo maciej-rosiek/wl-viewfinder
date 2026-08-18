@@ -29,6 +29,7 @@ region, so it never appears in the share.
 ## Usage
 
 ```
+wl-viewfinder blank    # start sharing, showing nothing
 wl-viewfinder window   # aim at the focused window, and follow it
 wl-viewfinder select   # drag out a region
 wl-viewfinder output   # the whole focused output
@@ -38,6 +39,10 @@ wl-viewfinder status   # units, region, followed window
 ```
 
 What you share depends on where the mirror was parked, and under sway it is parked out of sight.
+
+Start with `blank` and the call sees a black screen until you aim at something -- and going back
+to `blank` mid-call hides the room again without dropping the share, because the output being
+shared outlives the mirror on it.
 
 **Under sway (the default).** The tool asks sway for a headless output -- a screen that renders and
 can be captured like any other, but that no display is showing -- and parks the mirror there

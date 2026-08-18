@@ -35,6 +35,7 @@ usage() {
   cat >&2 <<'USAGE'
 usage: wl-viewfinder <command>
 
+  blank    start sharing, showing nothing -- aim it afterwards
   window   aim at the focused window and follow it as it moves and resizes
   select   drag out a region
   output   the whole focused output
@@ -143,6 +144,9 @@ ensure_sink() {
     [ -n "$name" ] || return 1
     swaymsg "output $name mode $sink_mode" > /dev/null || true
     swaymsg "output $name position 20000 20000" > /dev/null || true
+    # Black, so that a sink with no mirror on it shares nothing rather than a wallpaper. sway
+    # spawns swaybg for this itself, so it costs no dependency of ours.
+    swaymsg "output $name bg #000000 solid_color" > /dev/null || true
     # A new output is given the next free workspace number, which would eat one of the numbers the
     # keyboard bindings expect. Renaming it also keeps it the output's active workspace, and only
     # the active one is rendered -- a mirror parked on any other produces no frames at all.
@@ -293,6 +297,20 @@ case "${1:-}" in
     mkdir -p "$state"; : > "$target"
     set_region "${picked#* }" "${picked%% *}"
     ;;
+  blank)
+    require systemd-run
+    if ! sink_enabled; then
+      echo "wl-viewfinder: blank needs the headless sink, which needs sway (swaymsg + jq)" >&2
+      exit 1
+    fi
+    # The sink outlives the mirror on purpose: this is the state to be in when a call starts and
+    # when you want the room to stop seeing something, and in both cases the share itself must
+    # survive. Stopping the mirror takes the frame and the follower with it -- they are BindsTo.
+    ensure_sink > /dev/null || { echo "wl-viewfinder: could not create the sink" >&2; exit 1; }
+    stop_unit "$follow_unit"
+    stop_unit "$mirror_unit"
+    rm -f "$target" "$current"
+    ;;
   follow) follow ;;
   off)
     stop_unit "$follow_unit"
@@ -308,6 +326,8 @@ case "${1:-}" in
     if unit_active "$mirror_unit" && [ -s "$current" ]; then
       read -r output region < "$current"
       printf 'Sharing %s on %s\n' "${region#* }" "$output"
+    elif sink_enabled && [ -n "$(sink_name)" ]; then
+      printf 'Sharing a blank screen\n'
     else
       printf 'Not sharing\n'
     fi
