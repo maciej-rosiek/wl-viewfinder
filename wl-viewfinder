@@ -27,6 +27,7 @@ target="$state/target"
 current="$state/current"
 sink_mode=${WL_VIEWFINDER_SINK_MODE:-1920x1080}
 sink_workspace=${WL_VIEWFINDER_SINK_WORKSPACE:-viewfinder}
+blank_workspace=${WL_VIEWFINDER_SINK_WORKSPACE:-viewfinder}-blank
 mirror_unit=wl-viewfinder-mirror
 frame_unit=wl-viewfinder-frame
 follow_unit=wl-viewfinder-follow
@@ -123,38 +124,72 @@ sink_enabled() {
   esac
 }
 
-sink_name() {
-  swaymsg -t get_outputs |
-    jq -r 'first(.[] | select(.name | startswith("HEADLESS-")) | .name) // empty'
+# Outputs are found by the workspace parked on them, not by name: sway numbers a fresh headless
+# output per session, so HEADLESS-1 is only ever right the first time.
+output_of_workspace() {
+  swaymsg -t get_workspaces | jq -r --arg w "$1" 'first(.[] | select(.name == $w) | .output) // empty'
+}
+
+sink_name() { output_of_workspace "$sink_workspace"; }
+blank_name() { output_of_workspace "$blank_workspace"; }
+
+new_headless() {
+  local ws=$1 mode=$2 x=$3 y=$4 known name auto
+  known=$(swaymsg -t get_outputs | jq -c '[.[] | select(.active) | .name]')
+  # An output with no position of its own is placed automatically, in a row -- so parking a new one
+  # far away shoves the real screens sideways, and with them every coordinate already measured
+  # against them. Pinning everything where it is, before the new output exists, is what keeps a
+  # region valid. Done per creation, because the second output would move things too.
+  swaymsg "$(swaymsg -t get_outputs |
+    jq -r '[.[] | select(.active) | "output \"\(.name)\" position \(.rect.x) \(.rect.y)"] | join("; ")')" \
+    > /dev/null || true
+  swaymsg create_output > /dev/null || return 1
+  name=$(swaymsg -t get_outputs |
+    jq -r --argjson known "$known" 'first(.[] | select(.active) | select([.name] | inside($known) | not) | .name) // empty')
+  [ -n "$name" ] || return 1
+  swaymsg "output $name mode $mode" > /dev/null || true
+  # Far away rather than beside the real screens: sway hands the pointer across a shared edge, and
+  # an adjacent sink would swallow the cursor onto a screen nobody can see.
+  swaymsg "output $name position $x $y" > /dev/null || true
+  # Black, so anything sharing this output with nothing on it shares nothing rather than a
+  # wallpaper. sway spawns swaybg for it itself, so it costs no dependency of ours.
+  swaymsg "output $name bg #000000 solid_color" > /dev/null || true
+  # A new output is given the next free workspace number, which would eat one of the numbers the
+  # keyboard bindings expect. Renaming it also keeps it the output's active workspace, and only the
+  # active one is rendered -- a mirror parked on any other produces no frames at all.
+  auto=$(swaymsg -t get_workspaces | jq -r --arg o "$name" 'first(.[] | select(.output == $o) | .name) // empty')
+  [ -z "$auto" ] || [ "$auto" = "$ws" ] ||
+    swaymsg "rename workspace \"$auto\" to \"$ws\"" > /dev/null || true
+  printf '%s\n' "$name"
 }
 
 ensure_sink() {
-  local name ws pinned
+  local name
   name=$(sink_name)
-  if [ -z "$name" ]; then
-    # An output with no position of its own is placed automatically, in a row -- so parking the
-    # sink far away shoves the real screens sideways, and with them every coordinate the caller
-    # has already measured. Pinning them where they currently are, before the sink exists, is what
-    # keeps the region valid.
-    pinned=$(swaymsg -t get_outputs |
-      jq -r '[.[] | select(.active) | "output \"\(.name)\" position \(.rect.x) \(.rect.y)"] | join("; ")')
-    [ -z "$pinned" ] || swaymsg "$pinned" > /dev/null || true
-    swaymsg create_output > /dev/null || return 1
-    name=$(sink_name)
-    [ -n "$name" ] || return 1
-    swaymsg "output $name mode $sink_mode" > /dev/null || true
-    swaymsg "output $name position 20000 20000" > /dev/null || true
-    # Black, so that a sink with no mirror on it shares nothing rather than a wallpaper. sway
-    # spawns swaybg for this itself, so it costs no dependency of ours.
-    swaymsg "output $name bg #000000 solid_color" > /dev/null || true
-    # A new output is given the next free workspace number, which would eat one of the numbers the
-    # keyboard bindings expect. Renaming it also keeps it the output's active workspace, and only
-    # the active one is rendered -- a mirror parked on any other produces no frames at all.
-    ws=$(swaymsg -t get_workspaces | jq -r --arg o "$name" 'first(.[] | select(.output == $o) | .name) // empty')
-    [ -z "$ws" ] || [ "$ws" = "$sink_workspace" ] ||
-      swaymsg "rename workspace \"$ws\" to \"$sink_workspace\"" > /dev/null || true
-  fi
+  [ -n "$name" ] || name=$(new_headless "$sink_workspace" "$sink_mode" 20000 20000) || return 1
+  # Published because a screencast chooser has to tell this output from the blank source, and both
+  # are called HEADLESS-something. Matching the name by prefix would eventually pick the black one
+  # and share nothing for the rest of the call.
+  mkdir -p "$state"
+  printf '%s\n' "$name" > "$state/sink"
   printf '%s\n' "$name"
+}
+
+# The blank source exists so the mirror never has to stop. A share aimed at nothing is the mirror
+# pointed at this output, which keeps the "Shared region" window and the sink both present and
+# offerable -- stopping the mirror instead would take the window away, and a portal request that
+# asks only for windows would have nothing left to answer with. Small because it is only ever
+# black, and the mirror scales it up to the sink.
+ensure_blank() {
+  local name
+  name=$(blank_name)
+  [ -n "$name" ] || name=$(new_headless "$blank_workspace" 320x180 20000 22000) || return 1
+  printf '%s\n' "$name"
+}
+
+blank_region() {
+  swaymsg -t get_outputs |
+    jq -r --arg o "$1" 'first(.[] | select(.name == $o) | .rect | "\(.x),\(.y) \(.width)x\(.height)") // empty'
 }
 
 park_mirror() {
@@ -173,9 +208,9 @@ park_mirror() {
 
 drop_sink() {
   local name
-  name=$(sink_name)
-  [ -n "$name" ] || return 0
-  swaymsg "output $name unplug" > /dev/null 2>&1 || true
+  for name in $(sink_name) $(blank_name); do
+    [ -z "$name" ] || swaymsg "output $name unplug" > /dev/null 2>&1 || true
+  done
 }
 
 # --- end compositor backend --------------------------------------------------------------------
@@ -298,18 +333,21 @@ case "${1:-}" in
     set_region "${picked#* }" "${picked%% *}"
     ;;
   blank)
-    require systemd-run
+    require wl-present wl-viewfinder-frame systemd-run
     if ! sink_enabled; then
       echo "wl-viewfinder: blank needs the headless sink, which needs sway (swaymsg + jq)" >&2
       exit 1
     fi
-    # The sink outlives the mirror on purpose: this is the state to be in when a call starts and
-    # when you want the room to stop seeing something, and in both cases the share itself must
-    # survive. Stopping the mirror takes the frame and the follower with it -- they are BindsTo.
+    # The mirror keeps running, aimed at a black output. That is what makes this the state to join
+    # a call in and the way back out of one: the sink and the "Shared region" window both stay
+    # present, so nothing is renegotiated and no portal request is left with nothing to answer.
     ensure_sink > /dev/null || { echo "wl-viewfinder: could not create the sink" >&2; exit 1; }
+    black=$(ensure_blank) || { echo "wl-viewfinder: could not create the blank source" >&2; exit 1; }
+    region=$(blank_region "$black")
+    [ -n "$region" ] || { echo "wl-viewfinder: the blank source has no geometry" >&2; exit 1; }
     stop_unit "$follow_unit"
-    stop_unit "$mirror_unit"
-    rm -f "$target" "$current"
+    mkdir -p "$state"; : > "$target"
+    set_region "$region" "$black"
     ;;
   follow) follow ;;
   off)
@@ -319,13 +357,17 @@ case "${1:-}" in
       printf 'off\n' | timeout 2 tee "$fifo" > /dev/null || true
     fi
     stop_unit "$frame_unit"
-    rm -f "$fifo" "$target" "$current"
+    rm -f "$fifo" "$target" "$current" "$state/sink"
     if sink_enabled; then drop_sink; fi
     ;;
   label)
     if unit_active "$mirror_unit" && [ -s "$current" ]; then
       read -r output region < "$current"
-      printf 'Sharing %s on %s\n' "${region#* }" "$output"
+      if sink_enabled && [ "$output" = "$(blank_name)" ]; then
+        printf 'Sharing a blank screen\n'
+      else
+        printf 'Sharing %s on %s\n' "${region#* }" "$output"
+      fi
     elif sink_enabled && [ -n "$(sink_name)" ]; then
       printf 'Sharing a blank screen\n'
     else
