@@ -59,6 +59,7 @@ static struct {
 
 	int border;
 	uint32_t color;
+	bool fill;
 	bool running;
 } state = {
 	.border = 2,
@@ -232,7 +233,7 @@ static bool create_buffer(int width, int height) {
 		for (int col = 0; col < width; col++) {
 			bool in_ring = row < state.border || row >= height - state.border ||
 				col < state.border || col >= width - state.border;
-			row_pixels[(size_t)row * width + col] = in_ring ? state.color : 0;
+			row_pixels[(size_t)row * width + col] = (state.fill || in_ring) ? state.color : 0;
 		}
 	}
 
@@ -311,6 +312,48 @@ static void show(const char *output_name, int x, int y, int width, int height) {
 	wl_surface_commit(state.surface);
 }
 
+// Covers a whole output in opaque black and leaves it there. The blank source a share falls back to
+// is an output with nothing on it, and "nothing" is not what a desktop shell draws: it paints its
+// wallpaper and its bar onto every output it can see, headless ones included, and that is the
+// picture the call would be watching between shares. The overlay layer is above anything a shell
+// puts on an output, so this is black whatever else is running.
+static void cover(const char *output_name) {
+	struct output *out = find_output(output_name);
+	if (out == NULL) {
+		fprintf(stderr, "wl-viewfinder-frame: no output named %s\n", output_name);
+		return;
+	}
+	if (!out->has_logical || out->logical_width <= 0 || out->logical_height <= 0) {
+		fprintf(stderr, "wl-viewfinder-frame: no geometry for %s\n", output_name);
+		return;
+	}
+
+	hide();
+	state.fill = true;
+	state.color = 0xff000000;
+	if (!create_buffer(out->logical_width, out->logical_height)) {
+		fprintf(stderr, "wl-viewfinder-frame: could not allocate %dx%d buffer\n",
+			out->logical_width, out->logical_height);
+		return;
+	}
+
+	state.surface = wl_compositor_create_surface(state.compositor);
+	struct wl_region *empty = wl_compositor_create_region(state.compositor);
+	wl_surface_set_input_region(state.surface, empty);
+	wl_region_destroy(empty);
+
+	state.layer_surface = zwlr_layer_shell_v1_get_layer_surface(state.layer_shell, state.surface,
+		out->wl_output, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "wl-viewfinder");
+	zwlr_layer_surface_v1_add_listener(state.layer_surface, &layer_surface_listener, NULL);
+	zwlr_layer_surface_v1_set_anchor(state.layer_surface,
+		ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
+	zwlr_layer_surface_v1_set_size(state.layer_surface, out->logical_width, out->logical_height);
+	zwlr_layer_surface_v1_set_exclusive_zone(state.layer_surface, -1);
+	zwlr_layer_surface_v1_set_keyboard_interactivity(state.layer_surface,
+		ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+	wl_surface_commit(state.surface);
+}
+
 static void handle_line(const char *line) {
 	if (strcmp(line, "off") == 0 || strcmp(line, "quit") == 0) {
 		state.running = false;
@@ -326,6 +369,7 @@ static void handle_line(const char *line) {
 static void usage(void) {
 	fprintf(stderr, "usage: wl-viewfinder-frame [-f fifo] [-b border] [-c rrggbb]\n");
 	fprintf(stderr, "       wl-viewfinder-frame -l    list outputs as `name x,y wxh` and exit\n");
+	fprintf(stderr, "       wl-viewfinder-frame -k output   cover an output in black and stay\n");
 	exit(1);
 }
 
@@ -350,11 +394,15 @@ int main(int argc, char *argv[]) {
 		runtime_dir != NULL ? runtime_dir : "/tmp");
 
 	bool list_only = false;
+	const char *cover_output = NULL;
 	int opt;
-	while ((opt = getopt(argc, argv, "f:b:c:lh")) != -1) {
+	while ((opt = getopt(argc, argv, "f:b:c:k:lh")) != -1) {
 		switch (opt) {
 		case 'l':
 			list_only = true;
+			break;
+		case 'k':
+			cover_output = optarg;
 			break;
 		case 'f':
 			snprintf(fifo_path, sizeof(fifo_path), "%s", optarg);
@@ -405,6 +453,15 @@ int main(int argc, char *argv[]) {
 	if (state.compositor == NULL || state.shm == NULL || state.layer_shell == NULL) {
 		fprintf(stderr, "wl-viewfinder-frame: compositor does not support wlr-layer-shell\n");
 		return 1;
+	}
+
+	if (cover_output != NULL) {
+		cover(cover_output);
+		while (state.running && wl_display_dispatch(state.display) >= 0) {
+		}
+		hide();
+		wl_display_disconnect(state.display);
+		return 0;
 	}
 
 	// Opened read-write so the frame is always its own writer: every caller is a separate,

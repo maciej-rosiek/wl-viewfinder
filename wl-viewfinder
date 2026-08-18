@@ -35,8 +35,10 @@ mirror_unit=wl-viewfinder-mirror
 frame_unit=wl-viewfinder-frame
 follow_unit=wl-viewfinder-follow
 watch_unit=wl-viewfinder-watch
+cover_unit=wl-viewfinder-cover
 off_unit=wl-viewfinder-off
 idle_grace=${WL_VIEWFINDER_IDLE_GRACE:-20}
+idle_start=${WL_VIEWFINDER_IDLE_START:-60}
 
 usage() {
   cat >&2 <<'USAGE'
@@ -268,6 +270,17 @@ start_watch() {
       -- wl-viewfinder watch
 }
 
+# The blank source is an output with nothing on it, and a desktop shell's idea of "nothing" is its
+# wallpaper and its bar -- drawn on every output it can see, headless ones included. So the output
+# is covered in black by our own layer surface, which is what makes a share that is showing nothing
+# actually look like nothing.
+start_cover() {
+  unit_active "$cover_unit" ||
+    systemd-run --user --collect --quiet --unit="$cover_unit" --setenv=PATH="$PATH" \
+      --property=BindsTo="$mirror_unit.service" --property=After="$mirror_unit.service" \
+      -- wl-viewfinder-frame -k "$1" > /dev/null
+}
+
 start_follow() {
   unit_active "$follow_unit" ||
     systemd-run --user --collect --quiet --unit="$follow_unit" --setenv=PATH="$PATH" \
@@ -339,6 +352,7 @@ show_blank() {
   region=$(blank_region "$black")
   [ -n "$region" ] || { echo "wl-viewfinder: the blank source has no geometry" >&2; return 1; }
   set_region "$region" "$black"
+  start_cover "$black"
 }
 
 # What the follower reads to know what the share is *meant* to be showing, which is not the same as
@@ -431,8 +445,24 @@ casting() {
 # existed, and is answered with the bare output name or toplevel identifier instead -- xdpw has to
 # be patched to accept those and to re-read its sources after the chooser exits.
 chooser_answer() {
-  local list sink identifier line
+  local list sink identifier line screen
   list=$(cat)
+
+  # A request that cannot take a window at all is somebody asking to share their whole screen, and
+  # a whole screen is what they get: the real one, with no viewfinder started for it. Nothing the
+  # viewfinder does -- aiming, following, blanking -- means anything when the answer is "all of
+  # it", and going through the mirror would only cost a scaling pass. Chrome asks once per tab of
+  # its dialog with a single-type mask, so its Entire Screen tab lands exactly here and its Window
+  # tab below.
+  if ! printf '%s\n' "$list" | grep -q '^Window:'; then
+    screen=$(focused_output)
+    screen=${screen%% *}
+    line=$(printf '%s\n' "$list" | grep -m1 -E "^Monitor: $screen( |\$)") || true
+    [ -n "$line" ] || line=$(printf '%s\n' "$list" | grep -m1 '^Monitor:') || true
+    printf '%s\n' "$line"
+    return
+  fi
+
   if ! unit_active "$mirror_unit"; then
     aim_blank > /dev/null || return 0
   fi
@@ -470,8 +500,26 @@ disarm() {
 # the ids already seen rather than by name.
 watch_casts() {
   local -A casts=()
-  local kind id aimed
-  while read -r kind id; do
+  local kind id aimed status
+  exec 3< <(pw-dump -m 2>/dev/null | jq --unbuffered -r '
+    .[] | if .info == null then "gone \(.id)"
+          elif ((.info.props["media.name"]? // "") | startswith("xdpw-stream-")) then "cast \(.id)"
+          else empty end')
+  while :; do
+    status=0
+    read -r -t "$idle_start" kind id <&3 || status=$?
+    if [ "$status" -ne 0 ]; then
+      # Not a timeout: pw-dump is gone, and a watcher that cannot see the graph has nothing to say.
+      [ "$status" -gt 128 ] || break
+      # A minute with nothing capturing, and no cast to end and take the viewfinder with it. This
+      # is somebody who armed a share and never joined a call -- the one way in that the teardown
+      # below cannot cover, because it hangs off a cast that never happened.
+      [ "${#casts[@]}" -eq 0 ] || continue
+      ! casting || continue
+      systemd-run --user --collect --quiet --unit="$off_unit" --setenv=PATH="$PATH" \
+        -- wl-viewfinder off
+      break
+    fi
     case "$kind" in
       cast) casts[$id]=1 ;;
       gone)
@@ -500,10 +548,7 @@ watch_casts() {
         break
         ;;
     esac
-  done < <(pw-dump -m 2>/dev/null | jq --unbuffered -r '
-    .[] | if .info == null then "gone \(.id)"
-          elif ((.info.props["media.name"]? // "") | startswith("xdpw-stream-")) then "cast \(.id)"
-          else empty end')
+  done
 }
 
 case "${1:-}" in
@@ -588,6 +633,7 @@ case "${1:-}" in
   off)
     stop_unit "$follow_unit"
     stop_unit "$watch_unit"
+    stop_unit "$cover_unit"
     stop_unit "$mirror_unit"
     if [ -p "$fifo" ]; then
       printf 'off\n' | timeout 2 tee "$fifo" > /dev/null || true
@@ -615,7 +661,7 @@ case "${1:-}" in
     fi
     ;;
   status)
-    for unit in "$mirror_unit" "$frame_unit" "$follow_unit" "$watch_unit"; do
+    for unit in "$mirror_unit" "$frame_unit" "$follow_unit" "$watch_unit" "$cover_unit"; do
       printf '%-24s %s\n' "$unit" "$(systemctl --user is-active "$unit.service" 2>/dev/null || true)"
     done
     if [ -s "$current" ]; then

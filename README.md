@@ -45,7 +45,9 @@ Start with `blank` and the call sees a black screen until you aim at something -
 to `blank` mid-call hides the room again without dropping the share. Blanking points the mirror at
 a second, small headless output that is only ever black rather than stopping it, so the window and
 the sink both stay present: a portal request that asks only for windows still has something to be
-answered with, and nothing is renegotiated.
+answered with, and nothing is renegotiated. That output is covered by an opaque black layer surface
+of our own, because a desktop shell draws its wallpaper and its bar on every output it can see --
+headless ones included -- and a blank share that shows a tiny desktop is not blank.
 
 **Under sway (the default).** The tool asks sway for a headless output -- a screen that renders and
 can be captured like any other, but that no display is showing -- and parks the mirror there
@@ -85,14 +87,23 @@ all, because a share of the whole screen is meant to be the whole screen.
 "stop sharing", or the meeting ended -- the tool goes back to `blank` by itself: the follower stops
 and the red frame goes away, because a rectangle claiming a share that has ended is exactly the lie
 the frame exists to prevent. Twenty seconds later, if nothing has started capturing and nobody has
-re-aimed, it stops altogether and unplugs its outputs. Needs `pw-dump`; without it the aim simply
-stays where you left it.
+re-aimed, it stops altogether and unplugs its outputs. A viewfinder that was armed by hand and
+never joined to a call gives up after a minute of nothing capturing, which is the same teardown
+reached from the one direction where no cast ever ends. Both need `pw-dump`; without it the aim
+simply stays where you left it. `WL_VIEWFINDER_IDLE_GRACE` and `WL_VIEWFINDER_IDLE_START` are the
+two waits.
 
 ## On demand
 
 `wl-viewfinder chooser` is the whole tool as an `xdg-desktop-portal-wlr` source chooser: point
-xdpw at it and every screencast request is answered with the viewfinder, which it starts if the
-request is the call's first. Nothing is prompted for and nothing runs between calls.
+xdpw at it and a screencast request that can take a window is answered with the viewfinder, which
+it starts if the request is the call's first. Nothing is prompted for and nothing runs between
+calls.
+
+A request that cannot take a window at all is answered with the **real screen** instead, and starts
+nothing: that is somebody asking to share everything, and there is nothing for a viewfinder to add
+to "all of it". Chrome asks the portal once per tab of its share dialog with a single-type mask, so
+its Entire Screen tab gets the screen and its Window tab gets the viewfinder.
 
 ```ini
 # ~/.config/xdg-desktop-portal-wlr/config
@@ -117,7 +128,7 @@ Without the patch the answer still works whenever the viewfinder is already runn
 | dependency | needed for |
 | --- | --- |
 | `wl-mirror` >= 0.18 (ships `wl-present`) | everything -- it is the engine |
-| a systemd user session | everything -- the four transient units |
+| a systemd user session | everything -- the five transient units |
 | `slurp` | `select`, and `output` when there is no sway |
 | `sway` + `jq` | `window`, and blanking the share off its workspace |
 | `pw-dump` (pipewire) | giving up the aim when the call ends |
@@ -149,11 +160,12 @@ wl-viewfinder window
       +-- wl-viewfinder follow                       (keeps the region on that window, and off
       |                                               every workspace but its own)
       +-- wl-viewfinder watch                        (gives up the aim when the call ends)
+      +-- wl-viewfinder-frame -k <blank output>      (keeps the blank source black)
 ```
 
-Four transient `systemd --user` units. The frame, the follower and the watcher are `BindsTo` the
-mirror, so closing the mirror window tears down everything -- a red frame left on screen claiming a
-share that has ended would be worse than no frame at all.
+Five transient `systemd --user` units. Everything is `BindsTo` the mirror, so closing the mirror
+window tears down the rest -- a red frame left on screen claiming a share that has ended would be
+worse than no frame at all.
 
 The watcher answers "is anybody still capturing" from the PipeWire graph rather than from the
 portal, which offers no way to ask: `xdg-desktop-portal-wlr` gives each cast a node named
@@ -166,6 +178,8 @@ resizes, so PipeWire never renegotiates and the share survives.
 
 `wl-viewfinder-frame` is a small wlroots-layer-shell client: overlay layer, empty input region so
 clicks fall through, and an shm buffer whose interior is transparent. It costs about 4 MB resident.
+`-k <output>` is the same client with the interior opaque and black, covering a whole output: that
+is what keeps the blank source blank, above whatever a desktop shell paints on it.
 It also answers `-l`, listing outputs as `name x,y wxh` from `xdg-output`; that is what lets the
 region-to-output lookup -- needed on every path -- work without asking a compositor.
 
