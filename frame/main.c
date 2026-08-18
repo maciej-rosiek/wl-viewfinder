@@ -355,7 +355,7 @@ static void cover(const char *output_name) {
 }
 
 static void handle_line(const char *line) {
-	if (strcmp(line, "off") == 0 || strcmp(line, "quit") == 0) {
+	if (strcmp(line, "off") == 0) {
 		state.running = false;
 		return;
 	}
@@ -367,7 +367,7 @@ static void handle_line(const char *line) {
 }
 
 static void usage(void) {
-	fprintf(stderr, "usage: wl-viewfinder-frame [-f fifo] [-b border] [-c rrggbb]\n");
+	fprintf(stderr, "usage: wl-viewfinder-frame [-b border] [-c rrggbb]\n");
 	fprintf(stderr, "       wl-viewfinder-frame -l    list outputs as `name x,y wxh` and exit\n");
 	fprintf(stderr, "       wl-viewfinder-frame -k output   cover an output in black and stay\n");
 	exit(1);
@@ -396,16 +396,13 @@ int main(int argc, char *argv[]) {
 	bool list_only = false;
 	const char *cover_output = NULL;
 	int opt;
-	while ((opt = getopt(argc, argv, "f:b:c:k:lh")) != -1) {
+	while ((opt = getopt(argc, argv, "b:c:k:lh")) != -1) {
 		switch (opt) {
 		case 'l':
 			list_only = true;
 			break;
 		case 'k':
 			cover_output = optarg;
-			break;
-		case 'f':
-			snprintf(fifo_path, sizeof(fifo_path), "%s", optarg);
 			break;
 		case 'b':
 			state.border = atoi(optarg);
