@@ -32,6 +32,8 @@ mirror_unit=wl-viewfinder-mirror
 frame_unit=wl-viewfinder-frame
 follow_unit=wl-viewfinder-follow
 watch_unit=wl-viewfinder-watch
+off_unit=wl-viewfinder-off
+idle_grace=${WL_VIEWFINDER_IDLE_GRACE:-20}
 
 usage() {
   cat >&2 <<'USAGE'
@@ -44,6 +46,7 @@ usage: wl-viewfinder <command>
   off      stop sharing, close the mirror and the frame
   label    one line describing what is being shared
   status   the units, the region and the followed window
+  chooser  answer an xdg-desktop-portal-wlr dmenu request with the viewfinder
 
 Under sway the mirror is parked on a headless output, so nothing appears on your screen and
 the thing to share is that monitor rather than a window. WL_VIEWFINDER_SINK=window puts it back
@@ -109,6 +112,20 @@ focused_output() {
 }
 
 subscribe_window_events() { swaymsg -m -t subscribe '["window"]'; }
+
+# How a screencast request that asks only for windows names the mirror. Retried because the
+# window is mapped asynchronously after the unit starts, and a request that had to create the
+# viewfinder asks for this immediately afterwards.
+mirror_identifier() {
+  local id tries
+  for tries in 1 2 3 4 5 6 7 8 9 10; do
+    id=$(swaymsg -t get_tree |
+      jq -r 'first(.. | objects | select(.app_id == "at.yrlf.wl_mirror") | .foreign_toplevel_identifier) // empty')
+    [ -z "$id" ] || break
+    sleep 0.3
+  done
+  printf '%s\n' "$id"
+}
 
 # The mirror has to be a real window somewhere, but nothing says it has to be on a screen you are
 # looking at. sway can invent a headless output on demand: it renders and can be captured like any
@@ -177,7 +194,7 @@ ensure_sink() {
 }
 
 # The blank source exists so the mirror never has to stop. A share aimed at nothing is the mirror
-# pointed at this output, which keeps the "Shared region" window and the sink both present and
+# pointed at this output, which keeps the "viewfinder" window and the sink both present and
 # offerable -- stopping the mirror instead would take the window away, and a portal request that
 # asks only for windows would have nothing left to answer with. Small because it is only ever
 # black, and the mirror scales it up to the sink.
@@ -273,7 +290,7 @@ set_region() {
     systemd-run --user --collect --quiet --unit="$mirror_unit" --setenv=PATH="$PATH" \
       --property=Restart=on-failure --property=RestartSec=1 \
       --property=ExecStartPost="$self_dir/wl-viewfinder park" -- \
-      wl-present mirror "$output" -r "$region" --title "Shared region"
+      wl-present mirror "$output" -r "$region" --title "viewfinder"
     if [ -n "$sink" ]; then
       park_mirror "$sink" ||
         echo "wl-viewfinder: could not park the mirror on $sink, it is on a real screen" >&2
@@ -286,7 +303,7 @@ set_region() {
 }
 
 # The mirror keeps running, aimed at a black output. That is what makes this the state to join a
-# call in and the way back out of one: the sink and the "Shared region" window both stay present,
+# call in and the way back out of one: the sink and the "viewfinder" window both stay present,
 # so nothing is renegotiated and no portal request is left with nothing to answer.
 aim_blank() {
   local black region
@@ -336,6 +353,36 @@ casting() {
     jq -e 'any(.[]; (.info.props["media.name"]? // "") | startswith("xdpw-stream-"))' > /dev/null
 }
 
+# Answers an xdg-desktop-portal-wlr request with the viewfinder, creating it if this request is
+# the first of the call -- which is what keeps the viewfinder from having to run all day for the
+# one moment it is needed. xdpw writes its source list on stdin, "Monitor: <name> <description>"
+# and "Window: <title> (<identifier>)" lines filtered by the request's type mask, so the list is
+# read only to learn which kind of source this request will take: an app that asks for windows
+# alone (Chrome does, once per tab of its dialog) cannot be answered with a monitor.
+#
+# A viewfinder that was already running is answered with its own line out of the list, which is
+# what stock xdpw expects. One created for this request cannot be in a list written before it
+# existed, and is answered with the bare output name or toplevel identifier instead -- xdpw has to
+# be patched to accept those and to re-read its sources after the chooser exits.
+chooser_answer() {
+  local list sink identifier line
+  list=$(cat)
+  if ! unit_active "$mirror_unit"; then
+    aim_blank > /dev/null || return 0
+  fi
+  if printf '%s\n' "$list" | grep -q '^Monitor:'; then
+    sink=$(cat "$state/sink" 2>/dev/null) || return 0
+    [ -n "$sink" ] || return 0
+    line=$(printf '%s\n' "$list" | grep -m1 "^Monitor: $sink ") || true
+    printf '%s\n' "${line:-$sink}"
+  else
+    identifier=$(mirror_identifier)
+    [ -n "$identifier" ] || return 0
+    line=$(printf '%s\n' "$list" | grep -m1 -F "($identifier)") || true
+    printf '%s\n' "${line:-$identifier}"
+  fi
+}
+
 # Back to the state a call is joined in. The mirror stays up, so the next portal request still has
 # something to answer and nothing is renegotiated; only the aim is given up, which puts the frame
 # around the black output where nobody can see it.
@@ -356,7 +403,7 @@ disarm() {
 # the ids already seen rather than by name.
 watch_casts() {
   local -A casts=()
-  local kind id
+  local kind id aimed
   while read -r kind id; do
     case "$kind" in
       cast) casts[$id]=1 ;;
@@ -369,6 +416,21 @@ watch_casts() {
         sleep 1
         ! casting || continue
         disarm
+        # Then the whole thing goes away rather than idling: a mirror nobody is watching still
+        # costs a few percent of a core, and while its headless outputs exist kanshi matches no
+        # profile, so docking and undocking stop working. Not at once, because the gap between an
+        # app's two sessions -- Chrome runs its dialog and the call as separate ones -- is a
+        # moment with nothing capturing, and tearing down inside it would drop the share. Left
+        # alone if the aim moved during the wait: that is somebody lining up the next share.
+        aimed=$(cat "$current" 2>/dev/null || true)
+        sleep "$idle_grace"
+        ! casting || continue
+        [ "$aimed" = "$(cat "$current" 2>/dev/null || true)" ] || continue
+        # Detached, because `off` stops the mirror this unit is BindsTo: run in line it would be
+        # killed halfway through and leave the headless outputs plugged in.
+        systemd-run --user --collect --quiet --unit="$off_unit" --setenv=PATH="$PATH" \
+          -- wl-viewfinder off
+        break
         ;;
     esac
   done < <(pw-dump -m 2>/dev/null | jq --unbuffered -r '
@@ -437,6 +499,14 @@ case "${1:-}" in
     ;;
   follow) follow ;;
   watch) watch_casts ;;
+  chooser)
+    require jq
+    if ! sink_enabled; then
+      echo "wl-viewfinder: chooser needs the headless sink, which needs sway (swaymsg + jq)" >&2
+      exit 1
+    fi
+    chooser_answer
+    ;;
   off)
     stop_unit "$follow_unit"
     stop_unit "$watch_unit"

@@ -36,6 +36,7 @@ wl-viewfinder output   # the whole focused output
 wl-viewfinder off      # stop
 wl-viewfinder label    # one line: what is being shared
 wl-viewfinder status   # units, region, followed window
+wl-viewfinder chooser  # answer a portal request with the viewfinder (see On demand)
 ```
 
 What you share depends on where the mirror was parked, and under sway it is parked out of sight.
@@ -55,7 +56,7 @@ issues a restore token for it without the patches a window target needs. `wl-vie
 unplugs it again.
 
 **Anywhere else,** or with `WL_VIEWFINDER_SINK=window`, the mirror is an ordinary window titled
-**"Shared region"** and that is what you hand over. It has to stay mapped and on a visible
+**"viewfinder"** and that is what you hand over. It has to stay mapped and on a visible
 workspace: a window the compositor is not drawing produces no frames, and the share freezes.
 
 `WL_VIEWFINDER_SINK_MODE` sets the shared resolution (default `1920x1080`). Regions of a different
@@ -78,8 +79,33 @@ switching workspaces changes what is shared. The red frame is there to keep that
 **The aim is given up when the call is.** The moment nothing is capturing any more -- you pressed
 "stop sharing", or the meeting ended -- the tool goes back to `blank` by itself: the follower stops
 and the red frame goes away, because a rectangle claiming a share that has ended is exactly the lie
-the frame exists to prevent. The mirror stays up, so joining the next call still costs one portal
-prompt. Needs `pw-dump`; without it the aim simply stays where you left it.
+the frame exists to prevent. Twenty seconds later, if nothing has started capturing and nobody has
+re-aimed, it stops altogether and unplugs its outputs. Needs `pw-dump`; without it the aim simply
+stays where you left it.
+
+## On demand
+
+`wl-viewfinder chooser` is the whole tool as an `xdg-desktop-portal-wlr` source chooser: point
+xdpw at it and every screencast request is answered with the viewfinder, which it starts if the
+request is the call's first. Nothing is prompted for and nothing runs between calls.
+
+```ini
+# ~/.config/xdg-desktop-portal-wlr/config
+[screencast]
+chooser_type=dmenu
+chooser_cmd=wl-viewfinder chooser
+```
+
+Running only while a call needs it matters for more than idle CPU: on sway a headless output that
+outlives the call is one `kanshi` cannot account for, and kanshi applies a profile only when it
+matches every connected output -- so a viewfinder left plugged in all day is a laptop that stops
+reacting to being docked.
+
+This needs **a patched xdpw** to work from cold. Stock xdpw writes the compositor's sources to the
+chooser and matches the reply against that list, so a source created *by* the chooser can never be
+picked. Two changes fix it: re-read the sources after the chooser exits, and accept a bare output
+name or toplevel identifier -- what a chooser can name for a source whose label it cannot know.
+Without the patch the answer still works whenever the viewfinder is already running.
 
 ## Install
 
