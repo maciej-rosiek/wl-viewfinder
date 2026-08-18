@@ -658,7 +658,7 @@ case "${1:-}" in
   follow) follow ;;
   watch) watch_casts ;;
   chooser)
-    require jq flock
+    require wl-present wl-viewfinder-frame systemd-run jq flock
     if ! sink_enabled; then
       echo "wl-viewfinder: chooser needs the headless sink, which needs sway (swaymsg + jq)" >&2
       exit 1
