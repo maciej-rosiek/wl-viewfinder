@@ -35,7 +35,7 @@ wl-viewfinder select   # drag out a region
 wl-viewfinder output   # the whole focused output
 wl-viewfinder off      # stop
 wl-viewfinder label    # one line: what is being shared
-wl-viewfinder status   # units, region, followed window
+wl-viewfinder status   # units, region, aim, followed window
 wl-viewfinder chooser  # answer a portal request with the viewfinder (see On demand)
 ```
 
@@ -73,8 +73,13 @@ bindsym $mod+Shift+n exec wl-viewfinder off
 rectangle goes with it. It deliberately does **not** follow focus -- re-aim explicitly, so glancing
 at another window never shares it by accident.
 
-Note the rectangle is a screen region, not a window handle: it shows whatever is underneath it, so
-switching workspaces changes what is shared. The red frame is there to keep that honest.
+**Leaving the workspace blanks the share.** The rectangle is a screen region, not a window handle,
+and an output only ever renders the workspace in front of you -- so switching workspaces would
+otherwise share the next one through the same hole. Instead the mirror goes to the black output
+until you come back, and then returns to exactly what it was showing. The red frame goes with it,
+which is why the rectangle disappears while you are away. `window` takes the guard from the window
+itself, so carrying it to another workspace carries the share with it; `output` is not guarded at
+all, because a share of the whole screen is meant to be the whole screen.
 
 **The aim is given up when the call is.** The moment nothing is capturing any more -- you pressed
 "stop sharing", or the meeting ended -- the tool goes back to `blank` by itself: the follower stops
@@ -114,7 +119,7 @@ Without the patch the answer still works whenever the viewfinder is already runn
 | `wl-mirror` >= 0.18 (ships `wl-present`) | everything -- it is the engine |
 | a systemd user session | everything -- the four transient units |
 | `slurp` | `select`, and `output` when there is no sway |
-| `sway` + `jq` | `window` only |
+| `sway` + `jq` | `window`, and blanking the share off its workspace |
 | `pw-dump` (pipewire) | giving up the aim when the call ends |
 
 Build needs a C compiler, `pkg-config`, `wayland-scanner` and `wayland-client` headers. The Wayland
@@ -141,7 +146,8 @@ wl-viewfinder window
       +-- asks sway for the focused window's geometry
       +-- wl-present mirror <output> -r <region>    (systemd user unit, the shared window)
       +-- wl-viewfinder-frame                        (layer-shell red frame, via a fifo)
-      +-- wl-viewfinder follow                       (keeps the region on that window)
+      +-- wl-viewfinder follow                       (keeps the region on that window, and off
+      |                                               every workspace but its own)
       +-- wl-viewfinder watch                        (gives up the aim when the call ends)
 ```
 
@@ -166,8 +172,9 @@ region-to-output lookup -- needed on every path -- work without asking a composi
 ## Porting
 
 Everything that knows this is sway lives between the `--- compositor backend` markers in
-`wl-viewfinder`: `focused_window`, `region_of_id`, `focused_output`, and `subscribe_window_events`.
-Only `window` calls them. Regions are `x,y WxH` in compositor-global logical coordinates.
+`wl-viewfinder`: `focused_window`, `region_of_id`, `focused_output`, `subscribe_events` and the
+three workspace lookups. Only `window` and the workspace guard call them. Regions are `x,y WxH` in
+compositor-global logical coordinates.
 
 Anything with `wlr-layer-shell` and a capture protocol wl-mirror supports (`wlr-screencopy` or
 `ext-image-copy-capture-v1`) can work: niri, Hyprland, river, Wayfire, COSMIC, labwc. **GNOME and

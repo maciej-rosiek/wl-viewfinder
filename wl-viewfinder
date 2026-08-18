@@ -9,9 +9,11 @@
 # the rectangle never touches the portal and never resizes the mirror window, so PipeWire never
 # renegotiates and a live share survives being re-aimed.
 #
-# The rectangle is a screen region, not a window: it shows whatever is under it, so switching
-# workspaces changes what is shared. wl-viewfinder-frame draws the red frame that says where it is,
-# and `window` keeps the rectangle glued to one window through the follower below.
+# The rectangle is a screen region, not a window: it shows whatever is under it, and an output only
+# ever renders the workspace in front of you -- so leaving that workspace would otherwise share the
+# next one through the same hole. wl-viewfinder-frame draws the red frame that says where the
+# rectangle is, and the follower below keeps it glued to one window and blanks the share whenever
+# the workspace it was aimed at is not the one on screen.
 set -euo pipefail
 
 # Sibling binaries are resolved next to this script, and the same PATH is handed to the units
@@ -25,6 +27,7 @@ state="${XDG_RUNTIME_DIR:-/tmp}/wl-viewfinder"
 fifo="$state/frame"
 target="$state/target"
 current="$state/current"
+aim_file="$state/aim"
 sink_mode=${WL_VIEWFINDER_SINK_MODE:-1920x1080}
 sink_workspace=${WL_VIEWFINDER_SINK_WORKSPACE:-viewfinder}
 blank_workspace=${WL_VIEWFINDER_SINK_WORKSPACE:-viewfinder}-blank
@@ -111,7 +114,24 @@ focused_output() {
       | "\(.name) \(.rect.x),\(.rect.y) \(.rect.width)x\(.rect.height)") // empty'
 }
 
-subscribe_window_events() { swaymsg -m -t subscribe '["window"]'; }
+workspace_of_id() {
+  swaymsg -t get_tree | jq -r --argjson id "$1" '
+    first(.. | objects | select(.type == "workspace")
+      | select([recurse(.nodes[]?, .floating_nodes[]?) | .id] | index($id))
+      | .name) // empty'
+}
+
+# The workspace a fixed region was aimed on: the one its output was showing at the time. Only the
+# visible workspace of an output is rendered, and the region is a hole in whatever is rendered.
+visible_workspace_of_output() {
+  swaymsg -t get_workspaces | jq -r --arg o "$1" 'first(.[] | select(.output == $o and .visible) | .name) // empty'
+}
+
+workspace_visible() {
+  swaymsg -t get_workspaces | jq -e --arg w "$1" 'any(.[]; .name == $w and .visible)' > /dev/null
+}
+
+subscribe_events() { swaymsg -m -t subscribe '["window","workspace"]'; }
 
 # How a screencast request that asks only for windows names the mirror. Retried because the
 # window is mapped asynchronously after the unit starts, and a request that had to create the
@@ -248,6 +268,13 @@ start_watch() {
       -- wl-viewfinder watch
 }
 
+start_follow() {
+  unit_active "$follow_unit" ||
+    systemd-run --user --collect --quiet --unit="$follow_unit" --setenv=PATH="$PATH" \
+      --property=BindsTo="$mirror_unit.service" --property=After="$mirror_unit.service" \
+      -- wl-viewfinder follow
+}
+
 push_frame() {
   unit_active "$frame_unit" ||
     systemd-run --user --collect --quiet --unit="$frame_unit" --setenv=PATH="$PATH" \
@@ -305,42 +332,81 @@ set_region() {
 # The mirror keeps running, aimed at a black output. That is what makes this the state to join a
 # call in and the way back out of one: the sink and the "viewfinder" window both stay present,
 # so nothing is renegotiated and no portal request is left with nothing to answer.
-aim_blank() {
+show_blank() {
   local black region
   ensure_sink > /dev/null || { echo "wl-viewfinder: could not create the sink" >&2; return 1; }
   black=$(ensure_blank) || { echo "wl-viewfinder: could not create the blank source" >&2; return 1; }
   region=$(blank_region "$black")
   [ -n "$region" ] || { echo "wl-viewfinder: the blank source has no geometry" >&2; return 1; }
-  stop_unit "$follow_unit"
-  mkdir -p "$state"; : > "$target"
   set_region "$region" "$black"
 }
 
-# Keeps the rectangle on a window as it is resized, moved or sent to another output. Sway's window
-# event carries no resize change -- retiling siblings moves their edges without announcing it at
-# all -- so the events only make the common cases instant and the read timeout is what actually
-# catches a resize. Milliseconds per poll, and only while a share is aimed at a window.
+# What the follower reads to know what the share is *meant* to be showing, which is not the same as
+# what it is showing: while the aimed workspace is off screen the mirror is on the black output and
+# this is the only record of the way back. Cleared, not rewritten, when the aim is given up -- an
+# empty aim is what tells the follower there is nothing left to restore.
+record_aim() {
+  mkdir -p "$state"
+  printf '%s %s %s\n' "${1:--}" "$2" "${3:--}" > "$aim_file"
+}
+
+aim_blank() {
+  stop_unit "$follow_unit"
+  mkdir -p "$state"; : > "$target"; : > "$aim_file"
+  show_blank
+}
+
+# Keeps the rectangle on a window as it is resized, moved or sent to another output, and off every
+# workspace but the one it was aimed at. Sway's window event carries no resize change -- retiling
+# siblings moves their edges without announcing it at all -- so the events only make the common
+# cases instant and the read timeout is what actually catches a resize. Milliseconds per poll, and
+# only while a share is aimed.
+#
+# Leaving the aimed workspace shows the black output rather than the workspace you switched to: the
+# rectangle is a hole in whatever the screen is rendering, so the alternative is sharing the next
+# workspace to anyone still watching. The aim is kept across it and restored on the way back, and
+# the frame goes with the mirror -- onto an output nobody is looking at, which is why the red
+# rectangle disappears while you are away.
 follow() {
-  local id region seen
+  local id out pos size region home last_home="" want seen away=0
   seen=$(cut -d' ' -f2- "$current" 2>/dev/null || true)
-  exec 3< <(subscribe_window_events)
+  exec 3< <(subscribe_events)
   while :; do
     read -r -t 0.3 _ <&3 || { [ $? -gt 128 ] || break; }
 
-    id=$(cat "$target" 2>/dev/null) || break
-    [ -n "$id" ] || break
+    [ -s "$aim_file" ] || break
+    read -r out pos size home < "$aim_file"
+    [ "$out" != "-" ] || out=""
+    want="$pos $size"
 
-    region=$(region_of_id "$id")
-    if [ -z "$region" ]; then
-      # The window is gone. The rectangle stays where it is rather than following something else,
-      # and the frame keeps saying what is still being shared.
-      : > "$target"
-      break
+    id=$(cat "$target" 2>/dev/null || true)
+    if [ -n "$id" ]; then
+      out=""
+      region=$(region_of_id "$id")
+      if [ -z "$region" ]; then
+        # The window is gone. The rectangle stays where it is rather than following something else,
+        # and the frame keeps saying what is still being shared -- so the aim becomes the region it
+        # last held, still guarded by the workspace the window was on.
+        : > "$target"
+        record_aim "$(cut -d' ' -f1 "$current" 2>/dev/null || true)" "$seen" "${last_home:-$home}"
+        continue
+      fi
+      want=$region
+      home=$(workspace_of_id "$id")
+      [ -z "$home" ] || last_home=$home
     fi
 
-    if [ "$region" != "$seen" ]; then
-      set_region "$region" || break
-      seen=$region
+    if sink_enabled && [ -n "$home" ] && [ "$home" != "-" ] && ! workspace_visible "$home"; then
+      if [ "$away" = 0 ] && show_blank; then
+        away=1
+      fi
+      continue
+    fi
+
+    if [ "$away" = 1 ] || [ "$want" != "$seen" ]; then
+      set_region "$want" ${out:+"$out"} || break
+      seen=$want
+      away=0
     fi
   done
 }
@@ -391,6 +457,7 @@ disarm() {
     aim_blank
   else
     stop_unit "$follow_unit"
+    mkdir -p "$state"; : > "$aim_file"
     [ ! -p "$fifo" ] || printf 'off\n' | timeout 2 tee "$fifo" > /dev/null || true
     stop_unit "$frame_unit"
   fi
@@ -448,13 +515,14 @@ case "${1:-}" in
     fi
     line=$(focused_window)
     [ -n "$line" ] || { echo "wl-viewfinder: no focused window" >&2; exit 1; }
+    stop_unit "$follow_unit"
     mkdir -p "$state"
     printf '%s\n' "${line%% *}" > "$target"
     set_region "${line#* }"
-    unit_active "$follow_unit" ||
-      systemd-run --user --collect --quiet --unit="$follow_unit" --setenv=PATH="$PATH" \
-        --property=BindsTo="$mirror_unit.service" --property=After="$mirror_unit.service" \
-        -- wl-viewfinder follow
+    # The workspace is left unset because the follower reads it off the window itself every pass,
+    # which is what lets a window carried to another workspace take its guard with it.
+    record_aim - "${line#* }" -
+    start_follow
     ;;
   select)
     require wl-present wl-viewfinder-frame systemd-run slurp
@@ -462,6 +530,13 @@ case "${1:-}" in
     stop_unit "$follow_unit"
     mkdir -p "$state"; : > "$target"
     set_region "${picked#* }" "${picked%% *}"
+    # Recorded after the fact, off the output set_region resolved: slurp answers "<unknown>" for
+    # the output often enough that its own answer cannot name the workspace to guard.
+    if have swaymsg && have jq && [ -s "$current" ]; then
+      read -r out pos size < "$current"
+      record_aim "$out" "$pos $size" "$(visible_workspace_of_output "$out")"
+      start_follow
+    fi
     ;;
   output)
     require wl-present wl-viewfinder-frame systemd-run
@@ -477,6 +552,9 @@ case "${1:-}" in
     stop_unit "$follow_unit"
     mkdir -p "$state"; : > "$target"
     set_region "${picked#* }" "${picked%% *}"
+    # No workspace guard and no follower: a share of the whole screen is meant to be the whole
+    # screen, and blanking it every time its owner changes workspace would be a share of nothing.
+    record_aim "${picked%% *}" "${picked#* }" -
     ;;
   blank)
     require wl-present wl-viewfinder-frame systemd-run
@@ -515,14 +593,18 @@ case "${1:-}" in
       printf 'off\n' | timeout 2 tee "$fifo" > /dev/null || true
     fi
     stop_unit "$frame_unit"
-    rm -f "$fifo" "$target" "$current" "$state/sink"
+    rm -f "$fifo" "$target" "$current" "$aim_file" "$state/sink"
     if sink_enabled; then drop_sink; fi
     ;;
   label)
     if unit_active "$mirror_unit" && [ -s "$current" ]; then
       read -r output region < "$current"
       if sink_enabled && [ "$output" = "$(blank_name)" ]; then
-        printf 'Sharing a blank screen\n'
+        if [ -s "$aim_file" ]; then
+          printf 'Sharing a blank screen -- the aim is on another workspace\n'
+        else
+          printf 'Sharing a blank screen\n'
+        fi
       else
         printf 'Sharing %s on %s\n' "${region#* }" "$output"
       fi
@@ -538,6 +620,9 @@ case "${1:-}" in
     done
     if [ -s "$current" ]; then
       printf '%-24s %s\n' "region" "$(cat "$current")"
+    fi
+    if [ -s "$aim_file" ]; then
+      printf '%-24s %s\n' "aim" "$(cat "$aim_file")"
     fi
     if [ -s "$target" ]; then
       printf '%-24s %s\n' "following con" "$(cat "$target")"
