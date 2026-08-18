@@ -36,8 +36,10 @@ wl-viewfinder chooser  # answer a portal request with the viewfinder (see On dem
 **Under sway (the default)** the mirror is parked on a headless output -- a screen that renders and
 can be captured, but that no display is showing. Nothing appears on your own screen, and the thing
 to share is that **monitor** (`HEADLESS-n`), once at the start of the call. `wl-viewfinder off`
-unplugs it. **Anywhere else,** or with `WL_VIEWFINDER_SINK=window`, the mirror is an ordinary window
-titled **"viewfinder"**, which has to stay mapped and visible or it produces no frames.
+unplugs it -- though not while something is still capturing, because unplugging an output out from
+under a live capture is a protocol error that takes xdg-desktop-portal-wlr down with it.
+**Anywhere else,** or with `WL_VIEWFINDER_SINK=window`, the mirror is an ordinary window titled
+**"viewfinder"**, which has to stay mapped and visible or it produces no frames.
 
 `blank` aims the mirror at a second, always-black headless output rather than stopping it, so the
 share is never dropped: join a call blank, and go back to `blank` mid-call to hide the room again.
@@ -48,7 +50,6 @@ Sway bindings:
 
 ```
 bindsym $mod+Shift+b exec wl-viewfinder window
-bindsym $mod+Shift+n exec wl-viewfinder off
 ```
 
 `window` follows the window, but deliberately **not** focus -- re-aim explicitly, so glancing at
@@ -117,9 +118,12 @@ wl-viewfinder window
       +-- wl-viewfinder-frame -k <blank output>      (keeps the blank source black)
 ```
 
-Five transient `systemd --user` units, all `BindsTo` the mirror, so closing the mirror window tears
-down the rest. Re-aiming feeds `wl-present set-region` on the running mirror: the window never
-resizes, so PipeWire never renegotiates and the share survives.
+Five transient `systemd --user` units; the four around the mirror are `BindsTo` it, so closing the
+mirror window tears down the rest. A sixth, `wl-viewfinder-off`, is started detached when the idle
+watcher gives up -- a teardown bound to the units it is stopping would be killed halfway through.
+
+Re-aiming feeds `wl-present set-region` on the running mirror: the window never resizes, so PipeWire
+never renegotiates and the share survives.
 
 The watcher answers "is anybody still capturing" from the PipeWire graph, which the portal offers no
 way to ask -- xdpw gives each cast a node named `xdpw-stream-<random>` that lives exactly as long as
@@ -135,8 +139,12 @@ compositor.
 ## Porting
 
 Everything that knows this is sway lives between the `--- compositor backend` markers in
-`wl-viewfinder`: `focused_window`, `region_of_id`, `focused_output`, `subscribe_events` and the
-three workspace lookups. Only `window` and the workspace guard call them. Regions are `x,y WxH` in
+`wl-viewfinder`: the aiming lookups (`focused_window`, `region_of_id`, `focused_output`,
+`subscribe_events` and the three workspace lookups) and everything that builds the headless sink
+(`mirror_identifier`, `sink_enabled`, `new_headless`, `ensure_sink`, `ensure_blank`, `blank_region`,
+`park_mirror`, `drop_sink` and the name lookups around them). `chooser`, `blank`, `off`, `park` and
+`label` all reach the second group, so a port is not just `window`: without it the tool degrades to
+`WL_VIEWFINDER_SINK=window`, an ordinary mirror window shared as a toplevel. Regions are `x,y WxH` in
 compositor-global logical coordinates.
 
 Anything with `wlr-layer-shell` and a capture protocol wl-mirror supports (`wlr-screencopy` or
