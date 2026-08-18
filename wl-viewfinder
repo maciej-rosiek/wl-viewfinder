@@ -28,6 +28,7 @@ fifo="$state/frame"
 target="$state/target"
 current="$state/current"
 aim_file="$state/aim"
+lock_file="$state/lock"
 sink_mode=${WL_VIEWFINDER_SINK_MODE:-1920x1080}
 sink_workspace=${WL_VIEWFINDER_SINK_WORKSPACE:-viewfinder}
 blank_workspace=${WL_VIEWFINDER_SINK_WORKSPACE:-viewfinder}-blank
@@ -75,6 +76,32 @@ require() {
 
 unit_active() { systemctl --user --quiet is-active "$1.service" 2>/dev/null; }
 stop_unit() { systemctl --user stop "$1.service" 2>/dev/null || true; }
+
+# Anything that creates the mirror or an output runs one at a time. Two of these racing is not
+# theoretical: a screencast chooser is re-entrant -- Slack asks three times for one share, and
+# xdpw runs a chooser per request -- and each would see no mirror and build a second one. Worse,
+# new_headless names its output by diffing against a list snapshotted before create_output, so a
+# concurrent creation makes it adopt the *other* one and rename its workspace.
+take_lock() {
+  mkdir -p "$state"
+  exec 9> "$lock_file"
+  flock -w 10 9 || { echo "wl-viewfinder: timed out waiting for the lock" >&2; exit 1; }
+}
+
+# The same lock for the long-running units, which must hold it for one action rather than forever.
+# A subshell, so the descriptor is closed on the way out.
+locked() {
+  mkdir -p "$state"
+  ( flock -w 10 9 || exit 1; "$@" ) 9> "$lock_file"
+}
+
+# Written whole or not at all: the follower reads these files while other commands rewrite them,
+# and a torn read of the aim looks exactly like the empty aim that tells it to give up and exit.
+write_state() {
+  local file=$1
+  shift
+  printf '%s\n' "$*" > "$file.new" && mv -f "$file.new" "$file"
+}
 
 # Which output holds a point. wl-viewfinder-frame is already a wayland client, so it can answer
 # this from xdg-output rather than from a compositor's IPC -- which is what keeps `select` and
@@ -211,7 +238,7 @@ ensure_sink() {
   # are called HEADLESS-something. Matching the name by prefix would eventually pick the black one
   # and share nothing for the rest of the call.
   mkdir -p "$state"
-  printf '%s\n' "$name" > "$state/sink"
+  write_state "$state/sink" "$name"
   printf '%s\n' "$name"
 }
 
@@ -337,7 +364,7 @@ set_region() {
     fi
   fi
 
-  printf '%s %s\n' "$output" "$region" > "$current"
+  write_state "$current" "$output $region"
   push_frame "$output $region"
   start_watch
 }
@@ -351,7 +378,9 @@ show_blank() {
   black=$(ensure_blank) || { echo "wl-viewfinder: could not create the blank source" >&2; return 1; }
   region=$(blank_region "$black")
   [ -n "$region" ] || { echo "wl-viewfinder: the blank source has no geometry" >&2; return 1; }
-  set_region "$region" "$black"
+  # Reported, not swallowed: callers turn a success here into "the share is blanked" and stop
+  # trying, so a failure that returned 0 would leave the real screen shared and nobody retrying.
+  set_region "$region" "$black" || return 1
   start_cover "$black"
 }
 
@@ -361,7 +390,7 @@ show_blank() {
 # empty aim is what tells the follower there is nothing left to restore.
 record_aim() {
   mkdir -p "$state"
-  printf '%s %s %s\n' "${1:--}" "$2" "${3:--}" > "$aim_file"
+  write_state "$aim_file" "${1:--} $2 ${3:--}"
 }
 
 aim_blank() {
@@ -411,14 +440,14 @@ follow() {
     fi
 
     if sink_enabled && [ -n "$home" ] && [ "$home" != "-" ] && ! workspace_visible "$home"; then
-      if [ "$away" = 0 ] && show_blank; then
+      if [ "$away" = 0 ] && locked show_blank; then
         away=1
       fi
       continue
     fi
 
     if [ "$away" = 1 ] || [ "$want" != "$seen" ]; then
-      set_region "$want" ${out:+"$out"} || break
+      locked set_region "$want" ${out:+"$out"} || break
       seen=$want
       away=0
     fi
@@ -530,7 +559,7 @@ watch_casts() {
         # graph is only believed once it has stayed empty.
         sleep 1
         ! casting || continue
-        disarm
+        locked disarm
         # Then the whole thing goes away rather than idling: a mirror nobody is watching still
         # costs a few percent of a core, and while its headless outputs exist kanshi matches no
         # profile, so docking and undocking stop working. Not at once, because the gap between an
@@ -553,16 +582,17 @@ watch_casts() {
 
 case "${1:-}" in
   window)
-    require wl-present wl-viewfinder-frame systemd-run
+    require wl-present wl-viewfinder-frame systemd-run flock
     if ! have swaymsg || ! have jq; then
       echo 'wl-viewfinder: window needs sway (swaymsg + jq); select works anywhere' >&2
       exit 1
     fi
+    take_lock
     line=$(focused_window)
     [ -n "$line" ] || { echo "wl-viewfinder: no focused window" >&2; exit 1; }
     stop_unit "$follow_unit"
     mkdir -p "$state"
-    printf '%s\n' "${line%% *}" > "$target"
+    write_state "$target" "${line%% *}"
     set_region "${line#* }"
     # The workspace is left unset because the follower reads it off the window itself every pass,
     # which is what lets a window carried to another workspace take its guard with it.
@@ -570,8 +600,11 @@ case "${1:-}" in
     start_follow
     ;;
   select)
-    require wl-present wl-viewfinder-frame systemd-run slurp
+    require wl-present wl-viewfinder-frame systemd-run flock slurp
+    # Outside the lock: slurp waits for a drag, and holding it for that long would stall a portal
+    # request arriving meanwhile.
     picked=$(slurp -f '%o %x,%y %wx%h') || exit 0
+    take_lock
     stop_unit "$follow_unit"
     mkdir -p "$state"; : > "$target"
     set_region "${picked#* }" "${picked%% *}"
@@ -584,7 +617,7 @@ case "${1:-}" in
     fi
     ;;
   output)
-    require wl-present wl-viewfinder-frame systemd-run
+    require wl-present wl-viewfinder-frame systemd-run flock
     # sway can name the focused output outright; without it, offering the outputs as slurp
     # rectangles is the portable way to ask which one.
     if have swaymsg && have jq; then
@@ -594,6 +627,7 @@ case "${1:-}" in
       picked=$(slurp -o -r -f '%o %x,%y %wx%h') || exit 0
     fi
     [ -n "$picked" ] || { echo "wl-viewfinder: no focused output" >&2; exit 1; }
+    take_lock
     stop_unit "$follow_unit"
     mkdir -p "$state"; : > "$target"
     set_region "${picked#* }" "${picked%% *}"
@@ -602,11 +636,12 @@ case "${1:-}" in
     record_aim "${picked%% *}" "${picked#* }" -
     ;;
   blank)
-    require wl-present wl-viewfinder-frame systemd-run
+    require wl-present wl-viewfinder-frame systemd-run flock
     if ! sink_enabled; then
       echo "wl-viewfinder: blank needs the headless sink, which needs sway (swaymsg + jq)" >&2
       exit 1
     fi
+    take_lock
     aim_blank
     ;;
   park)
@@ -623,14 +658,21 @@ case "${1:-}" in
   follow) follow ;;
   watch) watch_casts ;;
   chooser)
-    require jq
+    require jq flock
     if ! sink_enabled; then
       echo "wl-viewfinder: chooser needs the headless sink, which needs sway (swaymsg + jq)" >&2
       exit 1
     fi
+    # The re-entrant caller, and so the reason the lock exists: Slack asks three times for one
+    # share and xdpw runs a chooser per request, so without this each would find no mirror and
+    # build its own. Held across the whole answer, which is what makes the second request wait for
+    # the first one's viewfinder rather than race it.
+    take_lock
     chooser_answer
     ;;
   off)
+    require flock
+    take_lock
     stop_unit "$follow_unit"
     stop_unit "$watch_unit"
     stop_unit "$cover_unit"

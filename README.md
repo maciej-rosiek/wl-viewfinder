@@ -88,6 +88,7 @@ running.
 | --- | --- |
 | `wl-mirror` >= 0.18 (ships `wl-present`) | everything -- it is the engine |
 | a systemd user session | everything -- the transient units |
+| `flock` (util-linux) | serialising the commands that build the mirror -- a chooser is re-entrant |
 | `slurp` | `select`, and `output` when there is no sway |
 | `sway` + `jq` | `window`, and blanking the share off its workspace |
 | `pw-dump` (pipewire) | giving up the aim when the call ends |
