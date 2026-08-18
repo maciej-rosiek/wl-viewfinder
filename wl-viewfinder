@@ -128,9 +128,16 @@ sink_name() {
 }
 
 ensure_sink() {
-  local name ws
+  local name ws pinned
   name=$(sink_name)
   if [ -z "$name" ]; then
+    # An output with no position of its own is placed automatically, in a row -- so parking the
+    # sink far away shoves the real screens sideways, and with them every coordinate the caller
+    # has already measured. Pinning them where they currently are, before the sink exists, is what
+    # keeps the region valid.
+    pinned=$(swaymsg -t get_outputs |
+      jq -r '[.[] | select(.active) | "output \"\(.name)\" position \(.rect.x) \(.rect.y)"] | join("; ")')
+    [ -z "$pinned" ] || swaymsg "$pinned" > /dev/null || true
     swaymsg create_output > /dev/null || return 1
     name=$(sink_name)
     [ -n "$name" ] || return 1
