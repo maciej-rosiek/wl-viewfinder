@@ -682,7 +682,13 @@ case "${1:-}" in
     fi
     stop_unit "$frame_unit"
     rm -f "$fifo" "$target" "$current" "$aim_file" "$state/sink"
-    if sink_enabled; then drop_sink; fi
+    if sink_enabled; then
+      if casting; then
+        echo 'wl-viewfinder: still capturing -- outputs left plugged, run off again when it ends' >&2
+      else
+        drop_sink
+      fi
+    fi
     ;;
   label)
     if unit_active "$mirror_unit" && [ -s "$current" ]; then
