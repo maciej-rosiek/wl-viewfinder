@@ -252,7 +252,12 @@ set_region() {
     if sink_enabled; then
       sink=$(ensure_sink) || sink=""
     fi
-    systemd-run --user --collect --quiet --unit="$mirror_unit" --setenv=PATH="$PATH" -- \
+    # Restarted on failure because wl-mirror does occasionally segfault, and when it does the
+    # window a call is being shared through disappears -- taking the share with it, and leaving a
+    # portal request that asks only for windows with nothing to answer. The frame is BindsTo this
+    # unit, so it does not come back by itself after a restart; re-aiming restores it.
+    systemd-run --user --collect --quiet --unit="$mirror_unit" --setenv=PATH="$PATH" \
+      --property=Restart=on-failure --property=RestartSec=1 -- \
       wl-present mirror "$output" -r "$region" --title "Shared region"
     if [ -n "$sink" ]; then
       park_mirror "$sink" ||
