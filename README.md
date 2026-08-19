@@ -22,9 +22,10 @@ the cursor is in it, and re-aiming the rectangle never touches the portal.
 
 ## Install
 
-1. **Install it.** `nix profile install github:maciej-rosiek/wl-viewfinder`, or [build it](#building)
-   and `sudo make install`. Everything it drives is a separate program -- see
-   [dependencies](#dependencies); wl-mirror 0.18 or newer is the one nothing works without.
+1. **Install it.** `make && sudo make install`, or your package manager if somebody has packaged it
+   ([building](#building) is a compiler and three headers; there is a Nix flake too). Everything it
+   drives is a separate program, so install the [dependencies](#dependencies) as well -- wl-mirror
+   0.18 or newer is the one nothing works without.
 
 2. **Bind the aim.** A viewfinder is re-aimed far more often than it is started:
 
