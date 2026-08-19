@@ -30,7 +30,7 @@ wl-viewfinder output   # the whole focused output
 wl-viewfinder off      # stop
 wl-viewfinder label    # one line: what is being shared
 wl-viewfinder status   # units, region, aim, followed window
-wl-viewfinder chooser  # answer a portal request with the viewfinder (see On demand)
+wl-viewfinder chooser  # answer a portal request with the viewfinder (see As a portal chooser)
 ```
 
 **Under sway (the default)** the mirror is parked on a headless output -- a screen that renders and
@@ -61,27 +61,44 @@ guarded.
 if nothing starts capturing it stops and unplugs its outputs. `WL_VIEWFINDER_IDLE_GRACE` and
 `WL_VIEWFINDER_IDLE_START` are the two waits; both need `pw-dump`.
 
-## On demand
+## As a portal chooser
 
-`wl-viewfinder chooser` is the whole tool as an `xdg-desktop-portal-wlr` source chooser. A request
-that can take a window is answered with the viewfinder, started if it is the call's first. A request
-that cannot take a window at all is answered with the **real screen** and starts nothing -- that is
-somebody asking to share everything. Chrome asks once per tab of its dialog with a single-type mask,
-so its Entire Screen tab gets the screen and its Window tab gets the viewfinder. Nothing is prompted
-for, and nothing runs between calls.
+`wl-viewfinder chooser` is the whole tool as an `xdg-desktop-portal-wlr` source chooser. It draws
+nothing: it reads the source list xdpw writes to its stdin and prints one line back. A request that
+can take a window is answered with the viewfinder. A request that cannot take a window at all is
+answered with the **real screen** -- that is somebody asking to share everything, and a viewfinder
+has nothing to add to "all of it" but a scaling pass. Chrome asks once per tab of its dialog with a
+single-type mask, so its Entire Screen tab gets the screen and its Window tab gets the viewfinder.
 
 ```ini
 # ~/.config/xdg-desktop-portal-wlr/config
 [screencast]
 chooser_type=dmenu
-chooser_cmd=wl-viewfinder chooser
+chooser_cmd=/absolute/path/to/wl-viewfinder chooser
 ```
 
-This needs **a patched xdpw** to work from cold: stock xdpw matches the chooser's reply against the
-source list it wrote *beforehand*, so a source created *by* the chooser can never be picked. Two
-changes fix it -- re-read the sources after the chooser exits, and accept a bare output name or
-toplevel identifier. Without the patch the answer still works whenever the viewfinder is already
-running.
+**Arm the viewfinder before you press Share.** Bind `wl-viewfinder window` to a key and use it
+first. xdpw lists the available sources *before* it runs the chooser and matches the reply against
+that list, so a source the chooser makes during the request is not in it. Arming first puts the
+viewfinder in the list, and the answer is then an ordinary line out of it -- no patched xdpw, no
+picker, nothing prompted for.
+
+Forgetting is not fatal. The chooser still starts the viewfinder, but that first request has nothing
+to answer with and fails, and the app falls back to its own picker. Press Share again: the viewfinder
+exists now, and the second request is answered silently. `WL_VIEWFINDER_IDLE_START` (default 300
+seconds) is how long an armed viewfinder waits for a capture before it gives up and unplugs itself.
+
+Two things about `chooser_cmd`. It must be an **absolute path**: xdpw runs its chooser with a
+sandboxed PATH holding coreutils, findutils, grep, sed and systemd, and nothing else -- a bare name
+fails with `command not found` and the share dies with it. Under sway it also wants a two-line
+wrapper that puts sway's own `bin` on PATH, because the tool deliberately does not depend on the
+compositor:
+
+```sh
+#!/usr/bin/env bash
+PATH=/path/to/sway/bin:$PATH
+exec /absolute/path/to/wl-viewfinder chooser
+```
 
 ## Install
 
