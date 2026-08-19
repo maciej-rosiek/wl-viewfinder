@@ -81,6 +81,11 @@ next share.
 buffer with a transparent interior. It is drawn just outside the region, so it never appears in the
 share, and clicks pass through it.
 
+Outside is decided per side, against the output the region is on. A side the output leaves no room
+on -- every side of a whole-output share, one side of a window snapped to a screen edge -- is drawn
+just inside the region instead. That band is in the share, and it is the alternative to a rectangle
+nobody can see: sharing a whole screen would otherwise be the one share with no mark on it at all.
+
 ```
 wl-viewfinder-frame [-b border] [-c rrggbb]   draw a frame, take regions on stdin
 wl-viewfinder-frame -k <output>               fill an output with opaque black and stay

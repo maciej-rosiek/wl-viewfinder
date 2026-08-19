@@ -1,9 +1,14 @@
 // The frame that says what is being shared: a click-through red rectangle on the overlay layer,
 // steered by lines on a fifo.
 //
-// It is drawn in a band *around* the region, never on it -- the surface is inflated by the border
-// width on every side and only that ring is opaque, so the pixels the mirror captures stay exactly
-// the ones that were asked for. Drawing on the boundary instead would put a red edge in the share.
+// It is drawn in a band *around* the region wherever the output has room for one -- the surface is
+// inflated by the border width and only that ring is opaque, so the pixels the mirror captures stay
+// exactly the ones that were asked for. Drawing on the boundary instead would put a red edge in the
+// share.
+//
+// A side with no room outside is drawn just inside the region instead, which is every side of a
+// whole-output share. That red edge is in the share, and is the point: sharing the whole screen is
+// the one case where a rectangle only its owner can see is a rectangle nobody can see at all.
 //
 // The input region is empty, so clicks fall through to whatever is underneath. Without that the
 // frame would swallow input to the very window it is outlining.
@@ -271,7 +276,7 @@ static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 };
 
 // x/y/width/height describe the shared region in compositor-global coordinates; the surface placed
-// here is the ring just outside it.
+// here is the ring around it, hugging the inside of any edge the output leaves no room outside of.
 static void show(const char *output_name, int x, int y, int width, int height) {
 	struct output *out = find_output(output_name);
 	if (out == NULL) {
@@ -281,8 +286,24 @@ static void show(const char *output_name, int x, int y, int width, int height) {
 
 	hide();
 
-	int outer_width = width + 2 * state.border;
-	int outer_height = height + 2 * state.border;
+	// A layer surface is placed relative to its own output, callers report global coordinates.
+	int32_t origin_x = out->has_logical ? out->logical_x : out->x;
+	int32_t origin_y = out->has_logical ? out->logical_y : out->y;
+	// Which sides the output has room to take a band on. An output of unknown size -- no
+	// xdg-output, so no logical geometry -- is taken to have room, which is what this did before
+	// anybody asked the question.
+	bool sized = out->has_logical && out->logical_width > 0 && out->logical_height > 0;
+	int left = x - state.border >= origin_x ? state.border : 0;
+	int top = y - state.border >= origin_y ? state.border : 0;
+	int right = !sized || x + width + state.border <= origin_x + out->logical_width
+		? state.border : 0;
+	int bottom = !sized || y + height + state.border <= origin_y + out->logical_height
+		? state.border : 0;
+
+	// The ring is painted in the outermost border pixels of the surface either way, so a side
+	// that was pulled in paints over the first border pixels of the region itself.
+	int outer_width = width + left + right;
+	int outer_height = height + top + bottom;
 	if (!create_buffer(outer_width, outer_height)) {
 		fprintf(stderr, "wl-viewfinder-frame: could not allocate %dx%d buffer\n",
 			outer_width, outer_height);
@@ -300,11 +321,8 @@ static void show(const char *output_name, int x, int y, int width, int height) {
 	zwlr_layer_surface_v1_set_anchor(state.layer_surface,
 		ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
 	zwlr_layer_surface_v1_set_size(state.layer_surface, outer_width, outer_height);
-	// A layer surface is placed relative to its own output, callers report global coordinates.
-	int32_t origin_x = out->has_logical ? out->logical_x : out->x;
-	int32_t origin_y = out->has_logical ? out->logical_y : out->y;
 	zwlr_layer_surface_v1_set_margin(state.layer_surface,
-		y - origin_y - state.border, 0, 0, x - origin_x - state.border);
+		y - origin_y - top, 0, 0, x - origin_x - left);
 	// -1 keeps the frame over bars and docks instead of being pushed out of their zone.
 	zwlr_layer_surface_v1_set_exclusive_zone(state.layer_surface, -1);
 	zwlr_layer_surface_v1_set_keyboard_interactivity(state.layer_surface,

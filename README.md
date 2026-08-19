@@ -14,7 +14,8 @@ the cursor is in it, and re-aiming the rectangle never touches the portal.
 - Aim at a window, and follow it as it moves and resizes.
 - Re-aim during a call. Nothing is renegotiated, so the share does not flicker or drop.
 - The mouse cursor is in the share.
-- A red frame marks the rectangle. It is drawn outside the region, so it is never shared.
+- A red frame marks the rectangle. It is drawn outside the region, so it is never shared -- except
+  around a whole screen, where there is no outside and the frame hugs the screen edge.
 - Blank the share at any time without dropping it.
 - Answer the screencast portal directly, with no picker (see [Portal chooser](#portal-chooser)).
 - Video only. Audio is untouched.
