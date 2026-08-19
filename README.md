@@ -20,6 +20,49 @@ the cursor is in it, and re-aiming the rectangle never touches the portal.
 - Answer the screencast portal directly, with no picker (see [Portal chooser](#portal-chooser)).
 - Video only. Audio is untouched.
 
+## Install
+
+1. **Install it.** `nix profile install github:maciej-rosiek/wl-viewfinder`, or [build it](#building)
+   and `sudo make install`. Everything it drives is a separate program -- see
+   [dependencies](#dependencies); wl-mirror 0.18 or newer is the one nothing works without.
+
+2. **Bind the aim.** A viewfinder is re-aimed far more often than it is started:
+
+   ```
+   bindsym $mod+Shift+b exec wl-viewfinder window
+   ```
+
+3. **Point the portal at the chooser**, to have the sharing dialog answered for you:
+
+   ```ini
+   # ~/.config/xdg-desktop-portal-wlr/config
+   [screencast]
+   chooser_type=dmenu
+   chooser_cmd=/absolute/path/to/wl-viewfinder chooser
+   ```
+
+   The path has to be absolute, and under sway it has to be a wrapper -- both traps are in
+   [docs/portal-chooser.md]. Then `systemctl --user restart xdg-desktop-portal-wlr`.
+
+4. **Check it before you need it**, because a call is a poor place to find out. Press the binding: a
+   red rectangle should appear around the focused window, with the share waiting behind it.
+
+   ```sh
+   wl-viewfinder status                        # the units, the region, the followed window
+   cat "$XDG_RUNTIME_DIR/wl-viewfinder/sink"   # the monitor to pick in the dialog
+   ```
+
+   The rectangle is the whole check on any compositor. Under sway that second line matters too: it
+   names a monitor no screen shows, and it is what the dialog is answered with.
+
+5. **Then a real one.** With the viewfinder still armed, press Share in a browser and pick that
+   monitor -- or pick nothing, if the chooser is wired up and answers for you. Re-aim mid-call with
+   the same binding: the picture should follow without the call noticing. `wl-viewfinder off` stops
+   it, and it unplugs itself anyway once the last capture ends.
+
+Arming *before* pressing Share is the one step that is not optional. Why, and what it costs to
+forget, is under [Portal chooser](#portal-chooser).
+
 ## Usage
 
 ```
@@ -47,6 +90,12 @@ dialog is that monitor, `HEADLESS-n`. You pick it once, at the start of the call
 
 Everywhere else, and with `WL_VIEWFINDER_SINK=window`, the mirror is an ordinary window titled
 **viewfinder**. Share that window instead. It has to stay mapped and visible, or it makes no frames.
+
+The headless outputs are parked far away from the real ones, so that sway never hands the pointer
+across to a screen nobody can see. They are still part of the layout while a share is armed, which
+anything that captures the *layout* rather than an output will find: `grim` with no `-o` returns a
+mostly black image tens of thousands of pixels wide. Give such a tool an output, or the bounding box
+of the real ones.
 
 ### Aiming
 
