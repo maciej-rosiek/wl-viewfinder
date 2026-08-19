@@ -121,21 +121,11 @@ under a live capture is a protocol error, and it takes xdg-desktop-portal-wlr do
 | --- | --- | --- |
 | `WL_VIEWFINDER_SINK` | `auto` | `headless`, `window`, or `auto` for headless under sway |
 | `WL_VIEWFINDER_SINK_MODE` | `1920x1080` | the shared resolution; other ratios letterbox into it |
-| `WL_VIEWFINDER_SINK_FIT` | `0` | `1`: shape the sink like the region instead, resizing it live |
 | `WL_VIEWFINDER_SINK_WORKSPACE` | `viewfinder` | sway workspace that parks the headless outputs |
 | `WL_VIEWFINDER_IDLE_GRACE` | `20` | seconds between the last capture ending and the teardown |
 | `WL_VIEWFINDER_IDLE_START` | `300` | seconds an armed viewfinder waits for its first capture |
 
 The last two need `pw-dump`.
-
-A sink of fixed size is what makes re-aiming free: the stream format is negotiated from the output
-being captured, so an output that never changes size never renegotiates, and the mirror letterboxes
-whatever shape it is given into it. `WL_VIEWFINDER_SINK_FIT=1` trades that away. The sink takes the
-shape of the region -- `SINK_MODE` becomes a cap rather than a size, a smaller region is shared
-pixel for pixel and a larger one scaled down to fit -- so a narrow window is not pillarboxed and an
-ultrawide screen is not squeezed into a strip. The size then changes whenever the shape does, in the
-middle of a call, and the stream format changes with it. How well that goes is up to the application
-on the far side of the portal, which is why the fixed sink is the default.
 
 ## Portal chooser
 
