@@ -39,7 +39,7 @@ watch_unit=wl-viewfinder-watch
 cover_unit=wl-viewfinder-cover
 off_unit=wl-viewfinder-off
 idle_grace=${WL_VIEWFINDER_IDLE_GRACE:-20}
-idle_start=${WL_VIEWFINDER_IDLE_START:-60}
+idle_start=${WL_VIEWFINDER_IDLE_START:-300}
 
 usage() {
   cat >&2 <<'USAGE'
