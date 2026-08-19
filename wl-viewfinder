@@ -31,6 +31,7 @@ aim_file="$state/aim"
 lock_file="$state/lock"
 mirror_title=viewfinder
 sink_mode=${WL_VIEWFINDER_SINK_MODE:-1920x1080}
+sink_fit=${WL_VIEWFINDER_SINK_FIT:-0}
 sink_workspace=${WL_VIEWFINDER_SINK_WORKSPACE:-viewfinder}
 blank_workspace=${sink_workspace}-blank
 mirror_unit=wl-viewfinder-mirror
@@ -57,10 +58,20 @@ usage: wl-viewfinder <command>
 
 Under sway the mirror is parked on a headless output, so nothing appears on your screen and
 the thing to share is that monitor rather than a window. WL_VIEWFINDER_SINK=window puts it back
-in an ordinary window; WL_VIEWFINDER_SINK_MODE sets the shared resolution (default 1920x1080).
+in an ordinary window; WL_VIEWFINDER_SINK_MODE sets the shared resolution (default 1920x1080),
+and WL_VIEWFINDER_SINK_FIT=1 lets it follow the shape of what is aimed at instead.
 USAGE
   exit 1
 }
+
+# Transient units are started with the service manager's environment, not this shell's, and the
+# units re-aim: a follower that could not see these settings would drop back to the defaults
+# halfway through a share. PATH is in here for the same reason it is set above.
+unit_env=(--setenv=PATH="$PATH")
+for setting in WL_VIEWFINDER_SINK WL_VIEWFINDER_SINK_MODE WL_VIEWFINDER_SINK_FIT \
+  WL_VIEWFINDER_SINK_WORKSPACE WL_VIEWFINDER_IDLE_GRACE WL_VIEWFINDER_IDLE_START; do
+  [ -z "${!setting:-}" ] || unit_env+=(--setenv="$setting=${!setting}")
+done
 
 have() { command -v "$1" > /dev/null; }
 
@@ -231,10 +242,55 @@ new_headless() {
   printf '%s\n' "$name"
 }
 
+output_mode() {
+  swaymsg -t get_outputs |
+    jq -r --arg o "$1" 'first(.[] | select(.name == $o) | .rect | "\(.width)x\(.height)") // empty'
+}
+
+fit_enabled() { [ "$sink_fit" = 1 ]; }
+
+# A sink of fixed size is what makes re-aiming free: PipeWire negotiates the stream format from
+# the output being captured, so an output that never changes size never renegotiates, and the
+# mirror letterboxes whatever shape it is given into it. Fitting trades that away -- the sink
+# takes the shape of the region, so a narrow window is not pillarboxed and an ultrawide screen is
+# not squeezed into a strip, at the price of a format change mid-call every time the shape
+# changes. Whether that is survivable is up to the application on the far side of the portal.
+#
+# WL_VIEWFINDER_SINK_MODE becomes the cap rather than the size. A region smaller than the cap is
+# taken at its own size, so a window is shared pixel for pixel instead of being blown up here and
+# scaled back down by the call; a larger one is scaled down to fit. Even numbers, because the
+# encoders behind the portal want a chroma plane that divides.
+fit_mode() {
+  local size=${1#* } w h cap_w cap_h
+  h=${size#*x}
+  w=${size%%x*}
+  cap_w=${sink_mode%%x*}
+  cap_h=${sink_mode#*x}
+  case "$w-$h-$cap_w-$cap_h" in *[!0-9-]* | *--* | -* | *-) return 1 ;; esac
+  [ "$w" -gt 0 ] && [ "$h" -gt 0 ] && [ "$cap_w" -gt 0 ] && [ "$cap_h" -gt 0 ] || return 1
+  if [ "$w" -gt "$cap_w" ] || [ "$h" -gt "$cap_h" ]; then
+    if [ $((w * cap_h)) -gt $((h * cap_w)) ]; then
+      h=$((h * cap_w / w))
+      w=$cap_w
+    else
+      w=$((w * cap_h / h))
+      h=$cap_h
+    fi
+  fi
+  printf '%dx%d\n' "$((w < 2 ? 2 : w / 2 * 2))" "$((h < 2 ? 2 : h / 2 * 2))"
+}
+
+# The mode argument is the fitted one, and only ever passed by a caller that knows the region.
+# Without it an existing sink keeps the size it has -- blanking must not resize the sink back to
+# the default in the middle of a share.
 ensure_sink() {
-  local name
+  local mode=${1:-} name
   name=$(sink_name)
-  [ -n "$name" ] || name=$(new_headless "$sink_workspace" "$sink_mode" 20000 20000) || return 1
+  if [ -z "$name" ]; then
+    name=$(new_headless "$sink_workspace" "${mode:-$sink_mode}" 20000 20000) || return 1
+  elif [ -n "$mode" ] && [ "$mode" != "$(output_mode "$name")" ]; then
+    swaymsg "output $name mode $mode" > /dev/null || true
+  fi
   # Published because a screencast chooser has to tell this output from the blank source, and both
   # are called HEADLESS-something. Matching the name by prefix would eventually pick the black one
   # and share nothing for the rest of the call.
@@ -322,7 +378,7 @@ drop_sink() {
 start_watch() {
   have pw-dump && have jq || return 0
   unit_active "$watch_unit" ||
-    systemd-run --user --collect --quiet --unit="$watch_unit" --setenv=PATH="$PATH" \
+    systemd-run --user --collect --quiet --unit="$watch_unit" "${unit_env[@]}" \
       --property=Restart=on-failure --property=RestartSec=2 \
       --property=BindsTo="$mirror_unit.service" --property=After="$mirror_unit.service" \
       -- wl-viewfinder watch
@@ -334,21 +390,21 @@ start_watch() {
 # actually look like nothing.
 start_cover() {
   unit_active "$cover_unit" ||
-    systemd-run --user --collect --quiet --unit="$cover_unit" --setenv=PATH="$PATH" \
+    systemd-run --user --collect --quiet --unit="$cover_unit" "${unit_env[@]}" \
       --property=BindsTo="$mirror_unit.service" --property=After="$mirror_unit.service" \
       -- wl-viewfinder-frame -k "$1" > /dev/null
 }
 
 start_follow() {
   unit_active "$follow_unit" ||
-    systemd-run --user --collect --quiet --unit="$follow_unit" --setenv=PATH="$PATH" \
+    systemd-run --user --collect --quiet --unit="$follow_unit" "${unit_env[@]}" \
       --property=BindsTo="$mirror_unit.service" --property=After="$mirror_unit.service" \
       -- wl-viewfinder follow
 }
 
 push_frame() {
   unit_active "$frame_unit" ||
-    systemd-run --user --collect --quiet --unit="$frame_unit" --setenv=PATH="$PATH" \
+    systemd-run --user --collect --quiet --unit="$frame_unit" "${unit_env[@]}" \
       --property=BindsTo="$mirror_unit.service" --property=After="$mirror_unit.service" \
       -- wl-viewfinder-frame
   printf '%s\n' "$1" | timeout 5 tee "$fifo" > /dev/null ||
@@ -368,7 +424,11 @@ set_region() {
   mkdir -p "$state"
   [ -p "$fifo" ] || { rm -f "$fifo"; mkfifo "$fifo"; }
 
+  local fitted=""
+  ! fit_enabled || ! sink_enabled || fitted=$(fit_mode "$region") || fitted=""
+
   if unit_active "$mirror_unit"; then
+    [ -z "$fitted" ] || ensure_sink "$fitted" > /dev/null || true
     # wl-mirror's region is relative to the output it was started on, so a window dragged to
     # another screen needs the output moved first or the rectangle lands in empty space.
     previous=$(cut -d' ' -f1 "$current" 2>/dev/null || true)
@@ -379,7 +439,7 @@ set_region() {
     # asking through slurp, which is exactly the interactive step these bindings exist to avoid.
     local sink="" focus=""
     if sink_enabled; then
-      sink=$(ensure_sink) || sink=""
+      sink=$(ensure_sink "$fitted") || sink=""
       if [ -n "$sink" ]; then
         assign_mirror "$sink"
         focus=$(focus_mark)
@@ -395,7 +455,7 @@ set_region() {
     # window a call is being shared through disappears -- taking the share with it, and leaving a
     # portal request that asks only for windows with nothing to answer. The frame is BindsTo this
     # unit, so it does not come back by itself after a restart; re-aiming restores it.
-    systemd-run --user --collect --quiet --unit="$mirror_unit" --setenv=PATH="$PATH" \
+    systemd-run --user --collect --quiet --unit="$mirror_unit" "${unit_env[@]}" \
       --property=Restart=on-failure --property=RestartSec=1 \
       --property=ExecStartPost="$self_dir/wl-viewfinder park" -- \
       wl-present mirror "$output" -r "$region" --title "$mirror_title" "${place[@]}"
@@ -587,7 +647,7 @@ watch_casts() {
       # below cannot cover, because it hangs off a cast that never happened.
       [ "${#casts[@]}" -eq 0 ] || continue
       ! casting || continue
-      systemd-run --user --collect --quiet --unit="$off_unit" --setenv=PATH="$PATH" \
+      systemd-run --user --collect --quiet --unit="$off_unit" "${unit_env[@]}" \
         -- wl-viewfinder off
       break
     fi
@@ -614,7 +674,7 @@ watch_casts() {
         [ "$aimed" = "$(cat "$current" 2>/dev/null || true)" ] || continue
         # Detached, because `off` stops the mirror this unit is BindsTo: run in line it would be
         # killed halfway through and leave the headless outputs plugged in.
-        systemd-run --user --collect --quiet --unit="$off_unit" --setenv=PATH="$PATH" \
+        systemd-run --user --collect --quiet --unit="$off_unit" "${unit_env[@]}" \
           -- wl-viewfinder off
         break
         ;;
@@ -756,6 +816,10 @@ case "${1:-}" in
     done
     if [ -s "$current" ]; then
       printf '%-24s %s\n' "region" "$(cat "$current")"
+    fi
+    if sink_enabled; then
+      sink=$(sink_name || true)
+      [ -z "$sink" ] || printf '%-24s %s\n' "sink" "$sink $(output_mode "$sink")"
     fi
     if [ -s "$aim_file" ]; then
       printf '%-24s %s\n' "aim" "$(cat "$aim_file")"
