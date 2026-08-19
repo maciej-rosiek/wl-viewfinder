@@ -29,6 +29,7 @@ target="$state/target"
 current="$state/current"
 aim_file="$state/aim"
 lock_file="$state/lock"
+mirror_title=viewfinder
 sink_mode=${WL_VIEWFINDER_SINK_MODE:-1920x1080}
 sink_workspace=${WL_VIEWFINDER_SINK_WORKSPACE:-viewfinder}
 blank_workspace=${sink_workspace}-blank
@@ -259,6 +260,36 @@ blank_region() {
     jq -r --arg o "$1" 'first(.[] | select(.name == $o) | .rect | "\(.x),\(.y) \(.width)x\(.height)") // empty'
 }
 
+# wl-mirror asks to be fullscreen on the sink, but it asks a moment too late: mesa commits the
+# first buffer from its own thread, and sway maps the window -- onto the workspace in front of you
+# -- before the request arrives. An `assign` is read while the window is being mapped, so it is the
+# only placement sway will honour early enough.
+#
+# The rule outlives the share, because sway keeps runtime criteria until it is reloaded. Hence both
+# the title, which keeps it off any other wl-mirror, and the output rather than the workspace: sway
+# skips an assign whose output is gone, so every rule left over from an earlier sink is inert,
+# while a rule naming a workspace would go on conjuring one.
+assign_mirror() {
+  swaymsg "assign [app_id=\"at.yrlf.wl_mirror\" title=\"^$mirror_title\$\"] output \"$1\"" \
+    > /dev/null 2>&1 || true
+}
+
+# sway focuses a new window wherever it lands, and a window on the sink is a window on a screen
+# nobody is looking at -- so starting a share would otherwise take the keyboard away from whatever
+# you were typing in. Read before the mirror exists, given back once it is parked.
+focus_mark() {
+  swaymsg -t get_tree | jq -r '
+    first(.. | objects | select(.focused == true)
+      | if .type == "workspace" then "ws " + .name else "con " + (.id | tostring) end) // empty'
+}
+
+focus_restore() {
+  case ${1:-} in
+    "con "*) swaymsg "[con_id=${1#con }] focus" > /dev/null 2>&1 || true ;;
+    "ws "*) swaymsg "workspace \"${1#ws }\"" > /dev/null 2>&1 || true ;;
+  esac
+}
+
 park_mirror() {
   local name=$1 id tries
   for tries in 1 2 3 4 5 6 7 8 9 10; do
@@ -346,16 +377,18 @@ set_region() {
   else
     # The output has to be positional: given only options, wl-present's mirror falls back to
     # asking through slurp, which is exactly the interactive step these bindings exist to avoid.
-    local sink=""
+    local sink="" focus=""
     if sink_enabled; then
       sink=$(ensure_sink) || sink=""
+      if [ -n "$sink" ]; then
+        assign_mirror "$sink"
+        focus=$(focus_mark)
+      fi
     fi
-    # Asking for the sink as the fullscreen output is what keeps the mirror off your screen:
-    # sway reads the requested fullscreen output before the window is mapped and maps it on that
-    # output's workspace, so it never lands in front of you and never retiles what is. Moving it
-    # afterwards, which park_mirror still does as a fallback, costs a visible second of the mirror
-    # sitting in your layout. Never both outputs at once -- wl-mirror refuses to mirror the output
-    # it is displayed on.
+    # Fullscreen on the sink from the first frame, so the share never opens on a window with
+    # borders and gaps around it. Where the window *lands* is assign_mirror's job above: this
+    # request loses its race with mesa often enough not to be a placement. Never both outputs at
+    # once -- wl-mirror refuses to mirror the output it is displayed on.
     local place=()
     [ -z "$sink" ] || [ "$sink" = "$output" ] || place=(--fullscreen-output "$sink")
     # Restarted on failure because wl-mirror does occasionally segfault, and when it does the
@@ -365,10 +398,11 @@ set_region() {
     systemd-run --user --collect --quiet --unit="$mirror_unit" --setenv=PATH="$PATH" \
       --property=Restart=on-failure --property=RestartSec=1 \
       --property=ExecStartPost="$self_dir/wl-viewfinder park" -- \
-      wl-present mirror "$output" -r "$region" --title "viewfinder" "${place[@]}"
+      wl-present mirror "$output" -r "$region" --title "$mirror_title" "${place[@]}"
     if [ -n "$sink" ]; then
       park_mirror "$sink" ||
         echo "wl-viewfinder: could not park the mirror on $sink, it is on a real screen" >&2
+      focus_restore "$focus"
     fi
   fi
 

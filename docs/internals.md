@@ -35,10 +35,28 @@ from the real outputs rather than beside them, because sway hands the pointer ac
 The outputs are found by the workspace parked on them, never by name: sway numbers a fresh headless
 output per session, so `HEADLESS-1` is only ever right the first time.
 
-The mirror asks to be fullscreen *on the sink* as it starts, rather than being moved there once it
-is up: sway reads the requested fullscreen output before it maps the window, so the window opens on
-the sink's workspace and the workspace in front of you is never retiled. It is moved as well, from
-the mirror unit's `ExecStartPost`, which covers a mirror that came back by itself after a crash.
+## Landing on the sink
+
+Three things put the mirror window on the sink, because the obvious one is not reliable on its own.
+
+`wl-present mirror --fullscreen-output <sink>` asks for fullscreen on the sink, so the first frame
+of the share is already the whole output rather than a window with borders around it. It is a poor
+*placement*, though: wl-mirror sends the request from its main thread while mesa commits the first
+buffer from another, and mesa often wins. sway maps the window before the request lands, in front of
+you, retiling your workspace for as long as it takes the fullscreen to arrive.
+
+So the window is claimed before it maps, with a sway `assign` rule matching this script's own mirror
+(`app_id` and title). Assignments are read while the view is being mapped, which is the only
+placement early enough to beat that race. The rule names the sink *output* rather than the
+`viewfinder` workspace: sway keeps runtime criteria until it is reloaded, and it skips an assign
+whose output no longer exists, so rules left over from earlier sinks do nothing, where a rule naming
+a workspace would keep conjuring one.
+
+Finally the mirror is moved onto the sink and fullscreened by hand, from the mirror unit's
+`ExecStartPost` -- which is what covers a mirror that came back by itself after a crash.
+
+The focus sway hands a newly mapped window is put back where it was, for the same reason: a share
+that starts by moving your keyboard onto a screen nobody can see is worse than one that flickers.
 
 ## Knowing that the call has ended
 
@@ -76,13 +94,13 @@ region-to-output lookup needs no compositor.
 ## Porting
 
 Everything that knows this is sway lives between the `--- compositor backend` markers in
-`wl-viewfinder`. Eighteen functions, in two groups:
+`wl-viewfinder`. Twenty-one functions, in two groups:
 
 - **aiming** -- `focused_window`, `region_of_id`, `focused_output`, `subscribe_events`,
   `workspace_of_id`, `visible_workspace_of_output`, `workspace_visible`
 - **the headless sink** -- `mirror_identifier`, `sink_enabled`, `output_of_workspace`, `sink_name`,
-  `blank_name`, `new_headless`, `ensure_sink`, `ensure_blank`, `blank_region`, `park_mirror`,
-  `drop_sink`
+  `blank_name`, `new_headless`, `ensure_sink`, `ensure_blank`, `blank_region`, `assign_mirror`,
+  `focus_mark`, `focus_restore`, `park_mirror`, `drop_sink`
 
 `chooser`, `blank`, `off`, `park` and `label` all reach the second group, so a port is not just
 `window`. Without it the tool degrades to `WL_VIEWFINDER_SINK=window`: an ordinary mirror window,
