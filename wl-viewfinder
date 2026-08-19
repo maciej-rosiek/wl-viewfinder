@@ -350,6 +350,14 @@ set_region() {
     if sink_enabled; then
       sink=$(ensure_sink) || sink=""
     fi
+    # Asking for the sink as the fullscreen output is what keeps the mirror off your screen:
+    # sway reads the requested fullscreen output before the window is mapped and maps it on that
+    # output's workspace, so it never lands in front of you and never retiles what is. Moving it
+    # afterwards, which park_mirror still does as a fallback, costs a visible second of the mirror
+    # sitting in your layout. Never both outputs at once -- wl-mirror refuses to mirror the output
+    # it is displayed on.
+    local place=()
+    [ -z "$sink" ] || [ "$sink" = "$output" ] || place=(--fullscreen-output "$sink")
     # Restarted on failure because wl-mirror does occasionally segfault, and when it does the
     # window a call is being shared through disappears -- taking the share with it, and leaving a
     # portal request that asks only for windows with nothing to answer. The frame is BindsTo this
@@ -357,7 +365,7 @@ set_region() {
     systemd-run --user --collect --quiet --unit="$mirror_unit" --setenv=PATH="$PATH" \
       --property=Restart=on-failure --property=RestartSec=1 \
       --property=ExecStartPost="$self_dir/wl-viewfinder park" -- \
-      wl-present mirror "$output" -r "$region" --title "viewfinder"
+      wl-present mirror "$output" -r "$region" --title "viewfinder" "${place[@]}"
     if [ -n "$sink" ]; then
       park_mirror "$sink" ||
         echo "wl-viewfinder: could not park the mirror on $sink, it is on a real screen" >&2

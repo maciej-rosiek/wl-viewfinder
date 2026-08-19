@@ -35,6 +35,11 @@ from the real outputs rather than beside them, because sway hands the pointer ac
 The outputs are found by the workspace parked on them, never by name: sway numbers a fresh headless
 output per session, so `HEADLESS-1` is only ever right the first time.
 
+The mirror asks to be fullscreen *on the sink* as it starts, rather than being moved there once it
+is up: sway reads the requested fullscreen output before it maps the window, so the window opens on
+the sink's workspace and the workspace in front of you is never retiled. It is moved as well, from
+the mirror unit's `ExecStartPost`, which covers a mirror that came back by itself after a crash.
+
 ## Knowing that the call has ended
 
 The portal offers no way to ask "is anybody still capturing", so the watcher reads the PipeWire
