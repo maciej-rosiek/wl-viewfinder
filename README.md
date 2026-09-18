@@ -42,8 +42,15 @@ the cursor is in it, and re-aiming the rectangle never touches the portal.
    chooser_cmd=/absolute/path/to/wl-viewfinder chooser
    ```
 
-   The path has to be absolute, and under sway it has to be a wrapper -- both traps are in
-   [docs/portal-chooser.md]. Then `systemctl --user restart xdg-desktop-portal-wlr`.
+   ```ini
+   # ~/.config/hypr/xdph.conf, for xdg-desktop-portal-hyprland
+   screencopy {
+       custom_picker_binary = /absolute/path/to/wl-viewfinder-picker
+   }
+   ```
+
+   The path has to be absolute, and it usually has to be a wrapper -- the traps, and the
+   two-line wrapper each portal needs, are in [docs/portal-chooser.md]. Then restart the portal.
 
 4. **Check it before you need it**, because a call is a poor place to find out. Press the binding: a
    red rectangle should appear around the focused window, with the share waiting behind it.
@@ -53,8 +60,8 @@ the cursor is in it, and re-aiming the rectangle never touches the portal.
    cat "$XDG_RUNTIME_DIR/wl-viewfinder/sink"   # the monitor to pick in the dialog
    ```
 
-   The rectangle is the whole check on any compositor. Under sway that second line matters too: it
-   names a monitor no screen shows, and it is what the dialog is answered with.
+   The rectangle is the whole check on any compositor. Under sway and Hyprland that second line
+   matters too: it names a monitor no screen shows, and it is what the dialog is answered with.
 
 5. **Then a real one.** With the viewfinder still armed, press Share in a browser and pick that
    monitor -- or pick nothing, if the chooser is wired up and answers for you. Re-aim mid-call with
@@ -74,7 +81,7 @@ wl-viewfinder blank    share, but show nothing
 wl-viewfinder off      stop
 wl-viewfinder label    one line: what is being shared
 wl-viewfinder status   the units, the region and the followed window
-wl-viewfinder chooser  answer a portal request with the viewfinder
+wl-viewfinder chooser  answer a portal picker request with the viewfinder
 ```
 
 Bind what you use:
@@ -85,18 +92,19 @@ bindsym $mod+Shift+b exec wl-viewfinder window
 
 ### What to share
 
-Under sway the mirror sits on a **headless output**: a screen that renders and can be captured, but
-that no monitor shows. Nothing appears on your own desktop, and the thing to pick in the sharing
-dialog is that monitor, `HEADLESS-n`. You pick it once, at the start of the call.
+Under sway and Hyprland the mirror sits on a **headless output**: a screen that renders and can be
+captured, but that no monitor shows. Nothing appears on your own desktop, and the thing to pick in
+the sharing dialog is that monitor -- `HEADLESS-n` under sway, `viewfinder` under Hyprland. You pick
+it once, at the start of the call.
 
 Everywhere else, and with `WL_VIEWFINDER_SINK=window`, the mirror is an ordinary window titled
 **viewfinder**. Share that window instead. It has to stay mapped and visible, or it makes no frames.
 
-The headless outputs are parked far away from the real ones, so that sway never hands the pointer
-across to a screen nobody can see. They are still part of the layout while a share is armed, which
-anything that captures the *layout* rather than an output will find: `grim` with no `-o` returns a
-mostly black image tens of thousands of pixels wide. Give such a tool an output, or the bounding box
-of the real ones.
+The headless outputs are parked far away from the real ones, so that the compositor never hands the
+pointer across to a screen nobody can see. They are still part of the layout while a share is
+armed, which anything that captures the *layout* rather than an output will find: `grim` with no
+`-o` returns a mostly black image tens of thousands of pixels wide. Give such a tool an output, or
+the bounding box of the real ones.
 
 ### Aiming
 
@@ -119,9 +127,10 @@ under a live capture is a protocol error, and it takes xdg-desktop-portal-wlr do
 
 | variable | default | |
 | --- | --- | --- |
-| `WL_VIEWFINDER_SINK` | `auto` | `headless`, `window`, or `auto` for headless under sway |
+| `WL_VIEWFINDER_COMPOSITOR` | `auto` | `sway`, `hyprland`, or `none`; `auto` reads it off the session |
+| `WL_VIEWFINDER_SINK` | `auto` | `headless`, `window`, or `auto` for headless where there is a backend |
 | `WL_VIEWFINDER_SINK_MODE` | `1920x1080` | the shared resolution; other ratios letterbox into it |
-| `WL_VIEWFINDER_SINK_WORKSPACE` | `viewfinder` | sway workspace that parks the headless outputs |
+| `WL_VIEWFINDER_SINK_WORKSPACE` | `viewfinder` | the workspace that parks the headless outputs; under Hyprland also the sink output's name |
 | `WL_VIEWFINDER_IDLE_GRACE` | `20` | seconds between the last capture ending and the teardown |
 | `WL_VIEWFINDER_IDLE_START` | `300` | seconds an armed viewfinder waits for its first capture |
 
@@ -129,8 +138,11 @@ The last two need `pw-dump`.
 
 ## Portal chooser
 
-`wl-viewfinder chooser` answers an [xdg-desktop-portal-wlr] request with the viewfinder. It draws
-nothing: it reads the source list on stdin and prints one line back. Stock xdpw, no patches.
+`wl-viewfinder chooser` answers a screencast portal's picker request with the viewfinder. It draws
+nothing. It speaks both picker protocols and tells them apart by how it was called: as an
+[xdg-desktop-portal-wlr] dmenu chooser it reads the source list on stdin and prints one line back;
+as an [xdg-desktop-portal-hyprland] `custom_picker_binary` it prints the `[SELECTION]` line that
+picker's own GUI would. Stock portals, no patches.
 
 ```ini
 # ~/.config/xdg-desktop-portal-wlr/config
@@ -139,13 +151,22 @@ chooser_type=dmenu
 chooser_cmd=/absolute/path/to/wl-viewfinder chooser
 ```
 
+```ini
+# ~/.config/hypr/xdph.conf
+screencopy {
+    custom_picker_binary = /absolute/path/to/wl-viewfinder-picker
+}
+```
+
 **Arm the viewfinder before you press Share.** xdpw lists its sources *before* it runs the chooser,
 so a source made during the request cannot be picked. Forgetting costs one press: the first request
 fails and the app falls back to its own picker, but the viewfinder is running by then, and the
-second press is answered silently.
+second press is answered silently. xdph looks its outputs up after the picker returns, so there the
+cold start is expected to work, but it has not been tried.
 
-The path has to be absolute, and under sway it needs a wrapper. Both traps, and what the chooser
-answers for which request, are in [docs/portal-chooser.md].
+The path has to be absolute, and it usually needs a wrapper -- xdph runs its picker with no
+arguments at all, so `wl-viewfinder-picker` above is a two-line script. Both traps, and what the
+chooser answers for which request, are in [docs/portal-chooser.md].
 
 ## Supported compositors
 
@@ -153,16 +174,24 @@ answers for which request, are in [docs/portal-chooser.md].
 a capture protocol wl-mirror supports (`wlr-screencopy` or `ext-image-copy-capture-v1`): sway, niri,
 Hyprland, river, Wayfire, COSMIC, labwc. GNOME and KDE implement neither and cannot work.
 
-`window`, and the headless output the share sits on, are sway-only for now. Everything that knows
-this is sway is in one marked block of the script -- see [porting](docs/internals.md#porting).
+`window`, and the headless output the share sits on, need a compositor backend: **sway** and
+**Hyprland** have one. Everything that knows which compositor this is lives in one marked block of
+the script, one set of functions per compositor -- see [porting](docs/internals.md#porting).
+
+The Hyprland backend is written against Hyprland 0.56 and works under either of its config
+languages, hyprlang and Lua. It has been checked against Hyprland's source and a scripted
+`hyprctl`, not yet against a running Hyprland, so treat the first share as the test.
 
 ## Dependencies
 
 - [wl-mirror] >= 0.18, which ships `wl-present` -- the engine
 - a systemd user session -- the transient units
 - `flock` (util-linux) -- the commands that build the mirror are re-entrant
-- `slurp` -- `select`, and `output` where there is no sway
-- `sway` and `jq` -- `window`, the headless output, and blanking off a workspace
+- `slurp` -- `select`, and `output` where there is no backend
+- `jq`, with `swaymsg` (sway) or `hyprctl` (Hyprland) -- `window`, the headless output, and
+  blanking off a workspace
+- `socat` -- optional, under Hyprland: reads the event socket so the follower reacts to a
+  workspace switch at once rather than on its next poll
 - `pw-dump` (pipewire) -- noticing that the call has ended
 
 ## Building
@@ -194,5 +223,6 @@ MIT, see [LICENSE](LICENSE).
 [wl-mirror]: https://github.com/Ferdi265/wl-mirror
 [wlroots#4037]: https://gitlab.freedesktop.org/wlroots/wlroots/-/issues/4037
 [xdg-desktop-portal-wlr]: https://github.com/emersion/xdg-desktop-portal-wlr
+[xdg-desktop-portal-hyprland]: https://github.com/hyprwm/xdg-desktop-portal-hyprland
 [docs/portal-chooser.md]: docs/portal-chooser.md
 [docs/internals.md]: docs/internals.md

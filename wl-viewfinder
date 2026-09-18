@@ -53,11 +53,14 @@ usage: wl-viewfinder <command>
   off      stop sharing, close the mirror and the frame
   label    one line describing what is being shared
   status   the units, the region and the followed window
-  chooser  answer an xdg-desktop-portal-wlr dmenu request with the viewfinder
+  chooser  answer a screencast portal's picker request with the viewfinder
+           (xdg-desktop-portal-wlr's dmenu chooser, or xdg-desktop-portal-hyprland's
+           custom_picker_binary)
 
-Under sway the mirror is parked on a headless output, so nothing appears on your screen and
-the thing to share is that monitor rather than a window. WL_VIEWFINDER_SINK=window puts it back
-in an ordinary window; WL_VIEWFINDER_SINK_MODE sets the shared resolution (default 1920x1080).
+Under sway and Hyprland the mirror is parked on a headless output, so nothing appears on your
+screen and the thing to share is that monitor rather than a window. WL_VIEWFINDER_SINK=window puts
+it back in an ordinary window; WL_VIEWFINDER_SINK_MODE sets the shared resolution (default
+1920x1080). WL_VIEWFINDER_COMPOSITOR=sway|hyprland|none overrides the compositor detection.
 USAGE
   exit 1
 }
@@ -81,8 +84,8 @@ stop_unit() { systemctl --user stop "$1.service" 2>/dev/null || true; }
 # Anything that creates the mirror or an output runs one at a time. Two of these racing is not
 # theoretical: a screencast chooser is re-entrant -- Slack asks three times for one share, and
 # xdpw runs a chooser per request -- and each would see no mirror and build a second one. Worse,
-# new_headless names its output by diffing against a list snapshotted before create_output, so a
-# concurrent creation makes it adopt the *other* one and rename its workspace.
+# sway's new_headless names its output by diffing against a list snapshotted before create_output,
+# so a concurrent creation makes it adopt the *other* one and rename its workspace.
 take_lock() {
   mkdir -p "$state"
   exec 9> "$lock_file"
@@ -106,7 +109,7 @@ write_state() {
 
 # Which output holds a point. wl-viewfinder-frame is already a wayland client, so it can answer
 # this from xdg-output rather than from a compositor's IPC -- which is what keeps `select` and
-# `output` working without sway.
+# `output` working without a backend.
 output_at() {
   local x=$1 y=$2 name origin size ox oy ow oh
   while read -r name origin size; do
@@ -120,31 +123,81 @@ output_at() {
   done < <(wl-viewfinder-frame -l)
 }
 
-# --- compositor backend: sway ------------------------------------------------------------------
-# Everything that knows which compositor this is lives below, and only `window` needs it: following
-# a window as it moves is the one question no wayland client can answer for itself. A port to
-# another compositor replaces exactly this much.
+# `name x,y WxH` for one output, from the same xdg-output listing. Logical coordinates, so no
+# backend has to redo the compositor's scale and transform arithmetic to describe an output.
+output_geometry() {
+  local name origin size
+  while read -r name origin size; do
+    [ "$name" = "$1" ] || continue
+    printf '%s %s %s\n' "$name" "$origin" "$size"
+    return
+  done < <(wl-viewfinder-frame -l)
+}
 
-focused_window() {
+# --- compositor backends ------------------------------------------------------------------------
+# Everything that knows which compositor this is lives between here and the end marker, and only
+# `window` needs it: following a window as it moves is the one question no wayland client can
+# answer for itself. The headless sink needs it too, and `chooser`, `blank`, `off`, `park` and
+# `label` all reach the sink. A port to another compositor adds one more set of the functions
+# listed in bind_backend, prefixed with its name.
+#
+# Decided from the session, not from what is installed: a machine with both compositors on it is
+# running one of them, and each exports its socket to every client it starts.
+detect_backend() {
+  case "${WL_VIEWFINDER_COMPOSITOR:-auto}" in
+    sway|hyprland) printf '%s\n' "$WL_VIEWFINDER_COMPOSITOR"; return ;;
+    none) return ;;
+  esac
+  have jq || return 0
+  if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && have hyprctl; then
+    echo hyprland
+  elif [ -n "${SWAYSOCK:-}" ] && have swaymsg; then
+    echo sway
+  elif have swaymsg; then
+    echo sway
+  elif have hyprctl; then
+    echo hyprland
+  fi
+}
+
+# Regions are `x,y WxH` in compositor-global logical coordinates; window ids are whatever the
+# compositor calls a window, opaque to everything outside the backend.
+bind_backend() {
+  local fn prefix
+  case $backend in
+    hyprland) prefix=hypr ;;
+    *) prefix=$backend ;;
+  esac
+  for fn in focused_window region_of_id focused_output workspace_of_id \
+            visible_workspace_of_output workspace_visible subscribe_events mirror_line \
+            sink_name blank_name new_headless blank_region assign_mirror \
+            focus_mark focus_restore park_mirror drop_sink; do
+    eval "$fn() { ${prefix}_$fn \"\$@\"; }"
+  done
+}
+
+# --- compositor backend: sway -------------------------------------------------------------------
+
+sway_focused_window() {
   swaymsg -t get_tree | jq -r '
     first(.. | objects
       | select(.focused == true and .foreign_toplevel_identifier != null)
       | "\(.id) \(.rect.x),\(.rect.y) \(.rect.width)x\(.rect.height)") // empty'
 }
 
-region_of_id() {
+sway_region_of_id() {
   swaymsg -t get_tree | jq -r --argjson id "$1" '
     first(.. | objects | select(.id == $id)
       | .rect | "\(.x),\(.y) \(.width)x\(.height)") // empty'
 }
 
-focused_output() {
+sway_focused_output() {
   swaymsg -t get_outputs | jq -r '
     first(.[] | select(.focused and (.name | startswith("HEADLESS-") | not))
       | "\(.name) \(.rect.x),\(.rect.y) \(.rect.width)x\(.rect.height)") // empty'
 }
 
-workspace_of_id() {
+sway_workspace_of_id() {
   swaymsg -t get_tree | jq -r --argjson id "$1" '
     first(.. | objects | select(.type == "workspace")
       | select([recurse(.nodes[]?, .floating_nodes[]?) | .id] | index($id))
@@ -153,28 +206,33 @@ workspace_of_id() {
 
 # The workspace a fixed region was aimed on: the one its output was showing at the time. Only the
 # visible workspace of an output is rendered, and the region is a hole in whatever is rendered.
-visible_workspace_of_output() {
+sway_visible_workspace_of_output() {
   swaymsg -t get_workspaces | jq -r --arg o "$1" 'first(.[] | select(.output == $o and .visible) | .name) // empty'
 }
 
-workspace_visible() {
+sway_workspace_visible() {
   swaymsg -t get_workspaces | jq -e --arg w "$1" 'any(.[]; .name == $w and .visible)' > /dev/null
 }
 
-subscribe_events() { swaymsg -m -t subscribe '["window","workspace"]'; }
+sway_subscribe_events() { swaymsg -m -t subscribe '["window","workspace"]'; }
 
-# How a screencast request that asks only for windows names the mirror. Retried because the
-# window is mapped asynchronously after the unit starts, and a request that had to create the
-# viewfinder asks for this immediately afterwards.
-mirror_identifier() {
-  local id tries
-  for tries in 1 2 3 4 5 6 7 8 9 10; do
+# The `Window:` line of an xdpw source list (on stdin) that is the mirror. xdpw names a window by
+# its foreign-toplevel identifier, which sway reports in its tree. Retried because the window is
+# mapped asynchronously after the unit starts, and a request that had to create the viewfinder
+# asks for this immediately afterwards. Falls back to the bare identifier, which a patched xdpw
+# accepts for a source that was not in its list.
+sway_mirror_line() {
+  local list id line
+  list=$(cat)
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
     id=$(swaymsg -t get_tree |
       jq -r 'first(.. | objects | select(.app_id == "at.yrlf.wl_mirror") | .foreign_toplevel_identifier) // empty')
     [ -z "$id" ] || break
     sleep 0.3
   done
-  printf '%s\n' "$id"
+  [ -n "$id" ] || return 0
+  line=$(printf '%s\n' "$list" | grep -m1 -F "($id)") || true
+  printf '%s\n' "${line:-$id}"
 }
 
 # The mirror has to be a real window somewhere, but nothing says it has to be on a screen you are
@@ -184,25 +242,22 @@ mirror_identifier() {
 # stable name and a fixed size -- re-aiming the rectangle never renegotiates the stream. And the
 # output is positioned far away rather than beside the real ones, because sway hands the pointer
 # across a shared edge: an adjacent sink would swallow the cursor onto a screen nobody can see.
-sink_enabled() {
-  case "${WL_VIEWFINDER_SINK:-auto}" in
-    window) return 1 ;;
-    headless) return 0 ;;
-    *) have swaymsg && have jq ;;
-  esac
-}
-
+#
 # Outputs are found by the workspace parked on them, not by name: sway numbers a fresh headless
 # output per session, so HEADLESS-1 is only ever right the first time.
-output_of_workspace() {
+sway_output_of_workspace() {
   swaymsg -t get_workspaces | jq -r --arg w "$1" 'first(.[] | select(.name == $w) | .output) // empty'
 }
 
-sink_name() { output_of_workspace "$sink_workspace"; }
-blank_name() { output_of_workspace "$blank_workspace"; }
+sway_sink_name() { sway_output_of_workspace "$sink_workspace"; }
+sway_blank_name() { sway_output_of_workspace "$blank_workspace"; }
 
-new_headless() {
-  local ws=$1 mode=$2 x=$3 y=$4 known name auto
+sway_new_headless() {
+  local role=$1 ws=$2 mode=$3 x y known name auto
+  case $role in
+    sink) x=20000; y=20000 ;;
+    *) x=20000; y=22000 ;;
+  esac
   known=$(swaymsg -t get_outputs | jq -c '[.[] | select(.active) | .name]')
   # An output with no position of its own is placed automatically, in a row -- so parking a new one
   # far away shoves the real screens sideways, and with them every coordinate already measured
@@ -231,31 +286,7 @@ new_headless() {
   printf '%s\n' "$name"
 }
 
-ensure_sink() {
-  local name
-  name=$(sink_name)
-  [ -n "$name" ] || name=$(new_headless "$sink_workspace" "$sink_mode" 20000 20000) || return 1
-  # Published because a screencast chooser has to tell this output from the blank source, and both
-  # are called HEADLESS-something. Matching the name by prefix would eventually pick the black one
-  # and share nothing for the rest of the call.
-  mkdir -p "$state"
-  write_state "$state/sink" "$name"
-  printf '%s\n' "$name"
-}
-
-# The blank source exists so the mirror never has to stop. A share aimed at nothing is the mirror
-# pointed at this output, which keeps the "viewfinder" window and the sink both present and
-# offerable -- stopping the mirror instead would take the window away, and a portal request that
-# asks only for windows would have nothing left to answer with. Small because it is only ever
-# black, and the mirror scales it up to the sink.
-ensure_blank() {
-  local name
-  name=$(blank_name)
-  [ -n "$name" ] || name=$(new_headless "$blank_workspace" 320x180 20000 22000) || return 1
-  printf '%s\n' "$name"
-}
-
-blank_region() {
+sway_blank_region() {
   swaymsg -t get_outputs |
     jq -r --arg o "$1" 'first(.[] | select(.name == $o) | .rect | "\(.x),\(.y) \(.width)x\(.height)") // empty'
 }
@@ -269,7 +300,7 @@ blank_region() {
 # the title, which keeps it off any other wl-mirror, and the output rather than the workspace: sway
 # skips an assign whose output is gone, so every rule left over from an earlier sink is inert,
 # while a rule naming a workspace would go on conjuring one.
-assign_mirror() {
+sway_assign_mirror() {
   swaymsg "assign [app_id=\"at.yrlf.wl_mirror\" title=\"^$mirror_title\$\"] output \"$1\"" \
     > /dev/null 2>&1 || true
 }
@@ -277,22 +308,22 @@ assign_mirror() {
 # sway focuses a new window wherever it lands, and a window on the sink is a window on a screen
 # nobody is looking at -- so starting a share would otherwise take the keyboard away from whatever
 # you were typing in. Read before the mirror exists, given back once it is parked.
-focus_mark() {
+sway_focus_mark() {
   swaymsg -t get_tree | jq -r '
     first(.. | objects | select(.focused == true)
       | if .type == "workspace" then "ws " + .name else "con " + (.id | tostring) end) // empty'
 }
 
-focus_restore() {
+sway_focus_restore() {
   case ${1:-} in
     "con "*) swaymsg "[con_id=${1#con }] focus" > /dev/null 2>&1 || true ;;
     "ws "*) swaymsg "workspace \"${1#ws }\"" > /dev/null 2>&1 || true ;;
   esac
 }
 
-park_mirror() {
-  local name=$1 id tries
-  for tries in 1 2 3 4 5 6 7 8 9 10; do
+sway_park_mirror() {
+  local name=$1 id
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
     id=$(swaymsg -t get_tree | jq -r 'first(.. | objects | select(.app_id == "at.yrlf.wl_mirror") | .id) // empty')
     [ -z "$id" ] || break
     sleep 0.3
@@ -304,14 +335,301 @@ park_mirror() {
   swaymsg "[con_id=$id] fullscreen enable" > /dev/null || true
 }
 
-drop_sink() {
+sway_drop_sink() {
   local name
-  for name in $(sink_name) $(blank_name); do
+  for name in $(sway_sink_name) $(sway_blank_name); do
     [ -z "$name" ] || swaymsg "output $name unplug" > /dev/null 2>&1 || true
   done
 }
 
-# --- end compositor backend --------------------------------------------------------------------
+# --- compositor backend: hyprland ---------------------------------------------------------------
+# Same shape as sway's, over hyprctl. Three things are different enough to be worth knowing.
+#
+# Outputs are found by name, not by workspace: Hyprland creates a headless output under any name
+# it is given, so the sink is simply the output called `viewfinder`. Its workspace is bound to it
+# by a workspace rule set before the output exists, which is what stops the new output eating the
+# next free workspace number -- renaming would not do, a renamed workspace keeps its number.
+#
+# Hyprland has two config languages since 0.55, and `hyprctl` speaks whichever the running config
+# is written in: `keyword` and the classic dispatchers under hyprlang, `eval` and `hl.*` under Lua.
+# Everything that writes to the compositor goes through hypr_config / hypr_dispatch, which carry
+# both spellings. Reads are `hyprctl -j`, which is the same in both.
+#
+# The sink is placed at a large *negative* x. Hyprland lays its outputs out afresh on every change:
+# explicitly positioned ones first, then `auto` ones to the right of everything placed so far. A
+# sink at a positive x would therefore push every auto-placed real screen past itself and move
+# every region already measured; one that ends left of x=0 never enters that calculation. The
+# price is a share whose region reads `-30000,0`, which wl-mirror parses through strtoul and gets
+# right by wrapping. Only `auto-left` and `auto-up` layouts see the sink at all.
+
+hypr_lua_cached=""
+hypr_lua() {
+  if [ -z "$hypr_lua_cached" ]; then
+    # `eval` exists only under the Lua config; hyprlang and older versions answer with an error.
+    if [ "$(hyprctl eval 'return 1' 2>/dev/null)" = ok ]; then
+      hypr_lua_cached=yes
+    else
+      hypr_lua_cached=no
+    fi
+  fi
+  [ "$hypr_lua_cached" = yes ]
+}
+
+# One write to the compositor, in whichever language it speaks: $1 is the Lua statement, $2 and
+# $3 the hyprlang keyword and its value. Never fails -- the caller checks the result it cares
+# about instead.
+hypr_config() {
+  if hypr_lua; then
+    hyprctl eval "$1" > /dev/null 2>&1 || true
+  else
+    hyprctl keyword "$2" "$3" > /dev/null 2>&1 || true
+  fi
+}
+
+# Likewise for a dispatcher: $1 the Lua call, $2 the classic dispatcher with its argument.
+hypr_dispatch() {
+  if hypr_lua; then
+    hyprctl dispatch "$1" > /dev/null 2>&1 || true
+  else
+    hyprctl dispatch "$2" > /dev/null 2>&1 || true
+  fi
+}
+
+hypr_focused_window() {
+  hyprctl -j activewindow | jq -r '
+    select(.address != null and .mapped == true)
+    | "\(.address) \(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"'
+}
+
+hypr_region_of_id() {
+  hyprctl -j clients | jq -r --arg a "$1" '
+    first(.[] | select(.address == $a and .mapped == true)
+      | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])") // empty'
+}
+
+# `hyprctl monitors` reports pixel sizes, so the geometry comes from xdg-output instead, which
+# already has the scale and the transform applied.
+hypr_focused_output() {
+  local name
+  name=$(hyprctl -j monitors | jq -r --arg s "$sink_workspace" --arg b "$blank_workspace" '
+    first(.[] | select(.focused and .name != $s and .name != $b) | .name) // empty')
+  [ -n "$name" ] || return 0
+  output_geometry "$name"
+}
+
+hypr_workspace_of_id() {
+  hyprctl -j clients | jq -r --arg a "$1" 'first(.[] | select(.address == $a) | .workspace.name) // empty'
+}
+
+# A special workspace open on an output is what that output shows, so it counts as the visible
+# one while it is up.
+hypr_visible_workspace_of_output() {
+  hyprctl -j monitors | jq -r --arg o "$1" '
+    first(.[] | select(.name == $o)
+      | if (.specialWorkspace.name // "") != "" then .specialWorkspace.name else .activeWorkspace.name end) // empty'
+}
+
+hypr_workspace_visible() {
+  hyprctl -j monitors |
+    jq -e --arg w "$1" 'any(.[]; .activeWorkspace.name == $w or .specialWorkspace.name == $w)' > /dev/null
+}
+
+# Hyprland's event socket, read through socat. Without socat the follower has no event stream and
+# simply polls: its read timeout catches everything the events would, a beat later. The stream is
+# filtered to what can move a window or change what an output shows, because Hyprland also
+# announces every focus change and title update, and each line costs the follower a few hyprctl
+# calls.
+hypr_subscribe_events() {
+  local sock="${XDG_RUNTIME_DIR:-/tmp}/hypr/${HYPRLAND_INSTANCE_SIGNATURE:-}/.socket2.sock"
+  if have socat && [ -S "$sock" ]; then
+    socat -u "UNIX-CONNECT:$sock" - |
+      grep --line-buffered -E '^(workspace|focusedmon|activespecial|movewindow|closewindow|fullscreen|changefloatingmode|monitor)'
+  else
+    sleep infinity
+  fi
+}
+
+# xdpw's window identifiers come from a wayland protocol hyprctl does not expose, so the mirror is
+# picked out of the list by its title instead, which is this script's own.
+hypr_mirror_line() {
+  grep -m1 -E "^Window: $mirror_title \(" || true
+}
+
+hypr_output_present() {
+  hyprctl -j monitors | jq -r --arg n "$1" 'first(.[] | select(.name == $n) | .name) // empty'
+}
+
+hypr_sink_name() { hypr_output_present "$sink_workspace"; }
+hypr_blank_name() { hypr_output_present "$blank_workspace"; }
+
+hypr_mirror_address() {
+  hyprctl -j clients | jq -r --arg t "$mirror_title" '
+    first(.[] | select(.class == "at.yrlf.wl_mirror" and .title == $t) | .address) // empty'
+}
+
+# What an output is showing, as `<selector> <name>`: the selector is the number for a numbered
+# workspace and `name:` plus the name otherwise, because `name:3` would be a *named* workspace
+# called 3, and a fresh one at that.
+hypr_active_workspace_of_output() {
+  hyprctl -j monitors | jq -r --arg o "$1" '
+    first(.[] | select(.name == $o) | .activeWorkspace
+      | (if (.id // 0) > 0 then (.id | tostring) else "name:" + .name end) + " " + .name) // empty'
+}
+
+hypr_new_headless() {
+  local role=$1 ws=$2 mode=$3 x
+  case $role in
+    sink) x=-30000 ;;
+    # Left of the sink rather than beside it, so that no width of sink can reach it.
+    *) x=-32000 ;;
+  esac
+  case $mode in
+    *@*) ;;
+    *) mode="$mode@60" ;;
+  esac
+  # Rules first, output second: both are read when the output appears. The monitor rule is what
+  # gives it a mode and a place; the workspace rule is what makes its first workspace the named
+  # one rather than the next free number, and what brings that workspace back to it if it exists.
+  hypr_config "hl.monitor({ output = \"$ws\", mode = \"$mode\", position = \"${x}x0\", scale = \"1\" })" \
+    monitor "$ws,$mode,${x}x0,1"
+  hypr_config "hl.workspace_rule({ workspace = \"name:$ws\", monitor = \"$ws\", default = true })" \
+    workspace "name:$ws, monitor:$ws, default:true"
+  hyprctl output create headless "$ws" > /dev/null 2>&1 || return 1
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -z "$(hypr_output_present "$ws")" ] || break
+    sleep 0.2
+  done
+  [ -n "$(hypr_output_present "$ws")" ] || return 1
+  printf '%s\n' "$ws"
+}
+
+hypr_blank_region() {
+  local geometry
+  geometry=$(output_geometry "$1")
+  [ -z "$geometry" ] || printf '%s\n' "${geometry#* }"
+}
+
+# The analogue of sway's assign: a static window rule is applied as the window opens, which is
+# the only placement early enough to beat wl-mirror's own fullscreen request (see sway above).
+# It names the workspace, and the workspace rule above binds that to the sink. Bound to the
+# title as well as the class, so no other wl-mirror is ever swept up by it. Under Lua the rule is
+# named, so re-asserting it replaces rather than accumulates; under hyprlang it accumulates until
+# the config is reloaded, which is harmless -- every copy says the same thing.
+hypr_assign_mirror() {
+  local class='^(at\.yrlf\.wl_mirror)$' title="^($mirror_title)\$"
+  if hypr_lua; then
+    hyprctl eval "hl.window_rule({ name = \"wl-viewfinder\", match = { class = [[$class]], title = [[$title]] }, workspace = \"name:$sink_workspace silent\", fullscreen = true })" \
+      > /dev/null 2>&1 || true
+  elif [ "$(hyprctl keyword windowrule "workspace name:$sink_workspace silent, fullscreen true, match:class $class, match:title $title" 2>/dev/null)" != ok ]; then
+    # Before 0.56 the same rule was spelled windowrulev2, one effect per line.
+    hyprctl keyword windowrulev2 "workspace name:$sink_workspace silent, class:$class, title:$title" > /dev/null 2>&1 || true
+    hyprctl keyword windowrulev2 "fullscreen, class:$class, title:$title" > /dev/null 2>&1 || true
+  fi
+}
+
+hypr_focus_mark() {
+  local address
+  address=$(hyprctl -j activewindow | jq -r '.address // empty')
+  if [ -n "$address" ]; then
+    printf 'con %s\n' "$address"
+  else
+    hyprctl -j activeworkspace | jq -r 'if (.id // 0) > 0 then "ws " + (.id | tostring) else "ws name:" + .name end'
+  fi
+}
+
+# Only if the focus actually moved: a silent rule leaves it alone, and focusing a window for no
+# reason would still warp the pointer to it.
+hypr_focus_restore() {
+  case ${1:-} in
+    "con "*)
+      [ "$(hyprctl -j activewindow | jq -r '.address // empty')" != "${1#con }" ] || return 0
+      hypr_dispatch "hl.dsp.focus({ window = \"address:${1#con }\" })" "focuswindow address:${1#con }"
+      ;;
+    "ws "*)
+      [ -n "$(hyprctl -j activewindow | jq -r '.address // empty')" ] || return 0
+      hypr_dispatch "hl.dsp.focus({ workspace = \"${1#ws }\" })" "workspace ${1#ws }"
+      ;;
+  esac
+}
+
+hypr_fullscreen() {
+  hyprctl -j clients |
+    jq -e --arg a "$1" 'any(.[]; .address == $a and ((.fullscreen | tostring) as $f | $f == "2" or $f == "3" or $f == "true"))' \
+    > /dev/null
+}
+
+hypr_park_mirror() {
+  local name=$1 id selector ws focus
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    id=$(hypr_mirror_address)
+    [ -z "$id" ] || break
+    sleep 0.3
+  done
+  [ -n "$id" ] || return 1
+  read -r selector ws < <(hypr_active_workspace_of_output "$name") || true
+  [ -n "${selector:-}" ] || return 1
+  # Onto whatever the sink is showing, which is the only workspace of it that renders.
+  if [ "$(hypr_workspace_of_id "$id")" != "$ws" ]; then
+    hypr_dispatch "hl.dsp.window.move({ window = \"address:$id\", workspace = \"$selector\", follow = false })" \
+      "movetoworkspacesilent $selector,address:$id"
+  fi
+  hypr_fullscreen "$id" && return 0
+  if hypr_lua; then
+    hyprctl dispatch "hl.dsp.window.fullscreen({ window = \"address:$id\", action = \"set\", mode = \"fullscreen\" })" \
+      > /dev/null 2>&1 || true
+  else
+    # The classic dispatcher only fullscreens the focused window, so the focus goes there and
+    # straight back, in one batch: nothing is rendered in between, and the pointer never lands on
+    # the sink.
+    focus=$(hyprctl -j activewindow | jq -r '.address // empty')
+    hyprctl --batch "dispatch focuswindow address:$id; dispatch fullscreen 0${focus:+; dispatch focuswindow address:$focus}" \
+      > /dev/null 2>&1 || true
+  fi
+}
+
+hypr_drop_sink() {
+  local name
+  for name in $(hypr_sink_name) $(hypr_blank_name); do
+    [ -z "$name" ] || hyprctl output remove "$name" > /dev/null 2>&1 || true
+  done
+}
+
+# --- end compositor backends --------------------------------------------------------------------
+
+backend=$(detect_backend)
+[ -z "$backend" ] || bind_backend
+
+sink_enabled() {
+  case "${WL_VIEWFINDER_SINK:-auto}" in
+    window) return 1 ;;
+    headless) return 0 ;;
+    *) [ -n "$backend" ] ;;
+  esac
+}
+
+ensure_sink() {
+  local name
+  name=$(sink_name)
+  [ -n "$name" ] || name=$(new_headless sink "$sink_workspace" "$sink_mode") || return 1
+  # Published because a screencast chooser has to tell this output from the blank source, and
+  # under sway both are called HEADLESS-something. Matching the name by prefix would eventually
+  # pick the black one and share nothing for the rest of the call.
+  mkdir -p "$state"
+  write_state "$state/sink" "$name"
+  printf '%s\n' "$name"
+}
+
+# The blank source exists so the mirror never has to stop. A share aimed at nothing is the mirror
+# pointed at this output, which keeps the "viewfinder" window and the sink both present and
+# offerable -- stopping the mirror instead would take the window away, and a portal request that
+# asks only for windows would have nothing left to answer with. Small because it is only ever
+# black, and the mirror scales it up to the sink.
+ensure_blank() {
+  local name
+  name=$(blank_name)
+  [ -n "$name" ] || name=$(new_headless blank "$blank_workspace" 320x180) || return 1
+  printf '%s\n' "$name"
+}
 
 # BindsTo the mirror so the frame cannot outlive what it is pointing at: closing the mirror
 # window ends the share, and a red rectangle still on screen would be claiming otherwise.
@@ -442,10 +760,10 @@ aim_blank() {
 }
 
 # Keeps the rectangle on a window as it is resized, moved or sent to another output, and off every
-# workspace but the one it was aimed at. Sway's window event carries no resize change -- retiling
-# siblings moves their edges without announcing it at all -- so the events only make the common
-# cases instant and the read timeout is what actually catches a resize. Milliseconds per poll, and
-# only while a share is aimed.
+# workspace but the one it was aimed at. Neither compositor announces a resize -- sway's window
+# event carries no resize change, and retiling siblings moves their edges without announcing it at
+# all -- so the events only make the common cases instant and the read timeout is what actually
+# catches a resize. Milliseconds per poll, and only while a share is aimed.
 #
 # Leaving the aimed workspace shows the black output rather than the workspace you switched to: the
 # rectangle is a hole in whatever the screen is rendering, so the alternative is sharing the next
@@ -496,27 +814,54 @@ follow() {
   done
 }
 
-# Whether anything is capturing through the portal right now. xdg-desktop-portal-wlr calls its
-# pipewire node xdpw-stream-<random> and that node exists for exactly as long as the cast does, so
-# the graph answers "is somebody watching" -- the portal itself offers no way to ask.
+# Whether anything is capturing through the portal right now. Each portal backend names its
+# pipewire node after itself -- xdpw-stream-<random>, xdph-streaming-<random> -- and that node
+# exists for exactly as long as the cast does, so the graph answers "is somebody watching"; the
+# portal itself offers no way to ask.
+cast_node_filter='(.info.props["media.name"]? // "") | (startswith("xdpw-stream-") or startswith("xdph-streaming-"))'
+
 casting() {
-  pw-dump 2>/dev/null |
-    jq -e 'any(.[]; (.info.props["media.name"]? // "") | startswith("xdpw-stream-"))' > /dev/null
+  pw-dump 2>/dev/null | jq -e "any(.[]; $cast_node_filter)" > /dev/null
 }
 
-# Answers an xdg-desktop-portal-wlr request with the viewfinder, creating it if this request is
+# Answers a screencast portal's picker request with the viewfinder, creating it if this request is
 # the first of the call -- which is what keeps the viewfinder from having to run all day for the
-# one moment it is needed. xdpw writes its source list on stdin, "Monitor: <name> <description>"
-# and "Window: <title> (<identifier>)" lines filtered by the request's type mask, so the list is
-# read only to learn which kind of source this request will take: an app that asks for windows
-# alone (Chrome does, once per tab of its dialog) cannot be answered with a monitor.
+# one moment it is needed. Two portals speak two protocols, told apart by the environment:
 #
-# A viewfinder that was already running is answered with its own line out of the list, which is
-# what stock xdpw expects. One created for this request cannot be in a list written before it
-# existed, and is answered with the bare output name or toplevel identifier instead -- xdpw has to
-# be patched to accept those and to re-read its sources after the chooser exits.
+# xdg-desktop-portal-wlr writes its source list on stdin, "Monitor: <name> <description>" and
+# "Window: <title> (<identifier>)" lines filtered by the request's type mask, so the list is read
+# only to learn which kind of source this request will take: an app that asks for windows alone
+# (Chrome does, once per tab of its dialog) cannot be answered with a monitor. A viewfinder that
+# was already running is answered with its own line out of the list, which is what stock xdpw
+# expects. One created for this request cannot be in a list written before it existed.
+#
+# xdg-desktop-portal-hyprland runs its picker with the window list in XDPH_WINDOW_SHARING_LIST
+# and `--allow-token` when restore tokens are on by default, and reads one `[SELECTION]<flags>/
+# screen:<output>` line back. It says nothing about the request's type mask, so the answer is
+# always the sink, and `r` in the flags asks for a restore token so that an app's second session
+# is answered without running the picker again.
 chooser_answer() {
-  local list sink identifier line screen
+  if [ -n "${XDPH_WINDOW_SHARING_LIST+set}" ]; then
+    picker_answer "$@"
+  else
+    dmenu_answer
+  fi
+}
+
+picker_answer() {
+  local flags="" sink
+  [ "${1:-}" != --allow-token ] || flags=r
+  if ! unit_active "$mirror_unit"; then
+    aim_blank > /dev/null || return 0
+  fi
+  sink=$(cat "$state/sink" 2>/dev/null) || return 0
+  [ -n "$sink" ] || return 0
+  # xdph drops the last character of the output name, which is meant to be this newline.
+  printf '[SELECTION]%s/screen:%s\n' "$flags" "$sink"
+}
+
+dmenu_answer() {
+  local list sink line screen
   list=$(cat)
 
   # A request that cannot take a window at all is somebody asking to share their whole screen, and
@@ -543,10 +888,7 @@ chooser_answer() {
     line=$(printf '%s\n' "$list" | grep -m1 "^Monitor: $sink ") || true
     printf '%s\n' "${line:-$sink}"
   else
-    identifier=$(mirror_identifier)
-    [ -n "$identifier" ] || return 0
-    line=$(printf '%s\n' "$list" | grep -m1 -F "($identifier)") || true
-    printf '%s\n' "${line:-$identifier}"
+    printf '%s\n' "$list" | mirror_line
   fi
 }
 
@@ -572,10 +914,10 @@ disarm() {
 watch_casts() {
   local -A casts=()
   local kind id aimed status
-  exec 3< <(pw-dump -m 2>/dev/null | jq --unbuffered -r '
-    .[] | if .info == null then "gone \(.id)"
-          elif ((.info.props["media.name"]? // "") | startswith("xdpw-stream-")) then "cast \(.id)"
-          else empty end')
+  exec 3< <(pw-dump -m 2>/dev/null | jq --unbuffered -r "
+    .[] | if .info == null then \"gone \\(.id)\"
+          elif ($cast_node_filter) then \"cast \\(.id)\"
+          else empty end")
   while :; do
     status=0
     read -r -t "$idle_start" kind id <&3 || status=$?
@@ -622,13 +964,15 @@ watch_casts() {
   done
 }
 
+no_backend() {
+  echo "wl-viewfinder: $1 needs sway (swaymsg + jq) or Hyprland (hyprctl + jq); select works anywhere" >&2
+  exit 1
+}
+
 case "${1:-}" in
   window)
     require wl-present wl-viewfinder-frame systemd-run flock
-    if ! have swaymsg || ! have jq; then
-      echo 'wl-viewfinder: window needs sway (swaymsg + jq); select works anywhere' >&2
-      exit 1
-    fi
+    [ -n "$backend" ] || no_backend window
     take_lock
     line=$(focused_window)
     [ -n "$line" ] || { echo "wl-viewfinder: no focused window" >&2; exit 1; }
@@ -652,7 +996,7 @@ case "${1:-}" in
     set_region "${picked#* }" "${picked%% *}"
     # Recorded after the fact, off the output set_region resolved: slurp answers "<unknown>" for
     # the output often enough that its own answer cannot name the workspace to guard.
-    if have swaymsg && have jq && [ -s "$current" ]; then
+    if [ -n "$backend" ] && [ -s "$current" ]; then
       read -r out pos size < "$current"
       record_aim "$out" "$pos $size" "$(visible_workspace_of_output "$out")"
       start_follow
@@ -660,9 +1004,9 @@ case "${1:-}" in
     ;;
   output)
     require wl-present wl-viewfinder-frame systemd-run flock
-    # sway can name the focused output outright; without it, offering the outputs as slurp
+    # A backend can name the focused output outright; without one, offering the outputs as slurp
     # rectangles is the portable way to ask which one.
-    if have swaymsg && have jq; then
+    if [ -n "$backend" ]; then
       picked=$(focused_output)
     else
       require slurp
@@ -679,10 +1023,7 @@ case "${1:-}" in
     ;;
   blank)
     require wl-present wl-viewfinder-frame systemd-run flock
-    if ! sink_enabled; then
-      echo "wl-viewfinder: blank needs the headless sink, which needs sway (swaymsg + jq)" >&2
-      exit 1
-    fi
+    sink_enabled || no_backend "blank (the headless sink)"
     take_lock
     aim_blank
     ;;
@@ -701,16 +1042,14 @@ case "${1:-}" in
   watch) watch_casts ;;
   chooser)
     require wl-present wl-viewfinder-frame systemd-run jq flock
-    if ! sink_enabled; then
-      echo "wl-viewfinder: chooser needs the headless sink, which needs sway (swaymsg + jq)" >&2
-      exit 1
-    fi
+    sink_enabled || no_backend "chooser (the headless sink)"
     # The re-entrant caller, and so the reason the lock exists: Slack asks three times for one
     # share and xdpw runs a chooser per request, so without this each would find no mirror and
     # build its own. Held across the whole answer, which is what makes the second request wait for
     # the first one's viewfinder rather than race it.
     take_lock
-    chooser_answer
+    shift
+    chooser_answer "$@"
     ;;
   off)
     require flock
@@ -754,6 +1093,7 @@ case "${1:-}" in
     for unit in "$mirror_unit" "$frame_unit" "$follow_unit" "$watch_unit" "$cover_unit"; do
       printf '%-24s %s\n' "$unit" "$(systemctl --user is-active "$unit.service" 2>/dev/null || true)"
     done
+    printf '%-24s %s\n' "compositor" "${backend:-none}"
     if [ -s "$current" ]; then
       printf '%-24s %s\n' "region" "$(cat "$current")"
     fi
@@ -761,7 +1101,7 @@ case "${1:-}" in
       printf '%-24s %s\n' "aim" "$(cat "$aim_file")"
     fi
     if [ -s "$target" ]; then
-      printf '%-24s %s\n' "following con" "$(cat "$target")"
+      printf '%-24s %s\n' "following" "$(cat "$target")"
     fi
     ;;
   *) usage ;;

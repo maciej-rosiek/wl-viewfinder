@@ -5,7 +5,7 @@
 ```
 wl-viewfinder window
       |
-      +-- asks sway for the focused window's geometry
+      +-- asks the compositor for the focused window's geometry
       +-- wl-present mirror <output> -r <region>    the shared window
       +-- wl-viewfinder-frame                       the red frame, fed through a fifo
       +-- wl-viewfinder follow                      keeps the region on that window
@@ -29,11 +29,13 @@ Re-aiming feeds `wl-present set-region` on the running mirror. The window never 
 never renegotiates and the share survives.
 
 That is also why the headless output has a fixed size and a stable name. It is positioned far away
-from the real outputs rather than beside them, because sway hands the pointer across a shared edge
--- an adjacent sink would swallow the cursor onto a screen nobody can see.
+from the real outputs rather than beside them, because the compositor hands the pointer across a
+shared edge -- an adjacent sink would swallow the cursor onto a screen nobody can see.
 
-The outputs are found by the workspace parked on them, never by name: sway numbers a fresh headless
-output per session, so `HEADLESS-1` is only ever right the first time.
+Under sway the outputs are found by the workspace parked on them, never by name: sway numbers a
+fresh headless output per session, so `HEADLESS-1` is only ever right the first time. Hyprland
+creates a headless output under any name it is given, so there the sink is simply the output called
+`viewfinder`.
 
 ## Landing on the sink
 
@@ -58,13 +60,35 @@ Finally the mirror is moved onto the sink and fullscreened by hand, from the mir
 The focus sway hands a newly mapped window is put back where it was, for the same reason: a share
 that starts by moving your keyboard onto a screen nobody can see is worse than one that flickers.
 
+Hyprland has the same three layers under other names. A static window rule matching the mirror's
+class and title (`workspace name:viewfinder silent`, `fullscreen`) is Hyprland's `assign`, applied
+as the window opens; a workspace rule binding `name:viewfinder` to the `viewfinder` output, set
+before the output exists, is what makes that workspace the output's first one rather than the next
+free number -- renaming would not do, a renamed workspace keeps its number, and a numbered
+workspace on a headless output is a `$mod+n` that focuses a screen nobody can see. The by-hand
+fallback moves the window with `movetoworkspacesilent` and fullscreens it; under hyprlang the
+classic `fullscreen` dispatcher only acts on the focused window, so the focus goes there and back
+inside one `hyprctl --batch`, where nothing is rendered in between.
+
+Hyprland's sink sits at a large *negative* x rather than a positive one. Hyprland re-lays its
+outputs out on every change, explicitly positioned ones first and `auto` ones to the right of
+everything placed so far, so a sink at a positive x would push every auto-placed real screen past
+itself; one ending left of x=0 never enters that calculation. wl-mirror parses the resulting
+`-30000,0` region through `strtoul`, which wraps it back to the right `int32_t`.
+
+Since 0.55 Hyprland has two config languages, and `hyprctl` speaks whichever the running config is
+written in: `keyword` plus the classic dispatchers under hyprlang, `eval` plus `hl.*` under Lua.
+The backend probes once with `hyprctl eval` and carries both spellings of every write. Reads are
+`hyprctl -j`, which is the same in both. Under hyprlang before 0.56 the window rule falls back to
+the `windowrulev2` spelling.
+
 ## Knowing that the call has ended
 
 The portal offers no way to ask "is anybody still capturing", so the watcher reads the PipeWire
-graph instead. xdpw gives every cast a node named `xdpw-stream-<random>` that lives exactly as long
-as the cast does. `pw-dump -m` opens with the graph as it stands and then prints one object per
-change; a removal arrives as an object with no info at all, so removals are matched against the ids
-already seen rather than by name.
+graph instead. Each portal gives every cast a node named after itself -- `xdpw-stream-<random>`,
+`xdph-streaming-<random>` -- that lives exactly as long as the cast does. `pw-dump -m` opens with
+the graph as it stands and then prints one object per change; a removal arrives as an object with
+no info at all, so removals are matched against the ids already seen rather than by name.
 
 An empty graph is believed only after a second, because a client that renegotiates drops its node
 and takes a new one straight away.
@@ -98,23 +122,34 @@ region-to-output lookup needs no compositor.
 
 ## Porting
 
-Everything that knows this is sway lives between the `--- compositor backend` markers in
-`wl-viewfinder`. Twenty-one functions, in two groups:
+Everything that knows which compositor this is lives between the `--- compositor backends` markers
+in `wl-viewfinder`: one set of functions per compositor, `sway_*` and `hypr_*`, and `bind_backend`
+aliases the bare names to whichever set `detect_backend` picked. A port is one more set of the
+seventeen, in two groups:
 
 - **aiming** -- `focused_window`, `region_of_id`, `focused_output`, `subscribe_events`,
   `workspace_of_id`, `visible_workspace_of_output`, `workspace_visible`
-- **the headless sink** -- `mirror_identifier`, `sink_enabled`, `output_of_workspace`, `sink_name`,
-  `blank_name`, `new_headless`, `ensure_sink`, `ensure_blank`, `blank_region`, `assign_mirror`,
-  `focus_mark`, `focus_restore`, `park_mirror`, `drop_sink`
+- **the headless sink** -- `mirror_line`, `sink_name`, `blank_name`, `new_headless`,
+  `blank_region`, `assign_mirror`, `focus_mark`, `focus_restore`, `park_mirror`, `drop_sink`
 
-`chooser`, `blank`, `off`, `park` and `label` all reach the second group, so a port is not just
-`window`. Without it the tool degrades to `WL_VIEWFINDER_SINK=window`: an ordinary mirror window,
-shared as a toplevel.
+plus a line in `detect_backend` that recognises the session. `chooser`, `blank`, `off`, `park` and
+`label` all reach the second group, so a port is not just `window`. Without a backend the tool
+degrades to `WL_VIEWFINDER_SINK=window`: an ordinary mirror window, shared as a toplevel.
 
-Regions are `x,y WxH` in compositor-global logical coordinates.
+Regions are `x,y WxH` in compositor-global logical coordinates; window ids are whatever the
+compositor calls a window, opaque outside the backend. `output_geometry` and `output_at` answer
+output questions from xdg-output, so a backend only has to *name* an output.
 
-The follower polls every 300 ms because sway's `window` IPC event has no resize change type. A
-compositor with a real geometry-changed event should drive it from events instead.
+The follower polls every 300 ms because neither compositor announces a resize: sway's `window`
+event has no resize change type, and Hyprland's socket has no geometry event at all. The event
+stream only makes the common cases instant, and a backend without one (Hyprland without `socat`)
+simply polls. A compositor with a real geometry-changed event should drive it from events instead.
+
+The Hyprland backend has been checked against Hyprland's source and a scripted `hyprctl`, not
+against a running Hyprland. What to watch on a first run: the sink appearing at `-30000,0` in
+`hyprctl monitors` with `viewfinder` as its workspace and no numbered workspace on it, the mirror
+landing there fullscreen without the focus moving, and `hyprctl reload` -- under hyprlang it drops
+every rule set at runtime, sink placement included, so re-arm after one.
 
 ## Notes
 

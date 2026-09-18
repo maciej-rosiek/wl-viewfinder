@@ -1,8 +1,11 @@
 # Portal chooser
 
-`wl-viewfinder chooser` is the whole tool as an `xdg-desktop-portal-wlr` source chooser. It draws
-nothing. xdpw writes its list of sources to the chooser's stdin, one per line, and reads one of
-those lines back:
+`wl-viewfinder chooser` is the whole tool as a screencast portal's source picker. It draws nothing,
+and it speaks two protocols: `xdg-desktop-portal-wlr`'s dmenu chooser, described first, and
+`xdg-desktop-portal-hyprland`'s custom picker, [below](#xdg-desktop-portal-hyprland).
+
+xdpw writes its list of sources to the chooser's stdin, one per line, and reads one of those lines
+back:
 
 ```
 Monitor: HEADLESS-2 headless output
@@ -19,8 +22,9 @@ chooser_cmd=/absolute/path/to/wl-viewfinder chooser
 ## What it answers
 
 A request that can take a window is answered with the viewfinder: the `Monitor:` line of the
-headless output it sits on, or -- with `WL_VIEWFINDER_SINK=window` -- the `Window:` line whose
-identifier matches the mirror.
+headless output it sits on, or -- with `WL_VIEWFINDER_SINK=window` -- the `Window:` line that is
+the mirror: matched by its foreign-toplevel identifier under sway, and by its `viewfinder` title
+under Hyprland, whose IPC does not expose the identifier.
 
 A request that cannot take a window at all is answered with the **real focused output**, and no
 viewfinder is started. That is somebody asking to share their whole screen, and a viewfinder has
@@ -66,6 +70,50 @@ exec /absolute/path/to/wl-viewfinder chooser
 
 Keep the line short either way. xdpw parses its config with inih, which silently truncates a line
 past ~200 characters; the symptom is again `command not found`.
+
+## xdg-desktop-portal-hyprland
+
+xdph has the same design -- a subprocess per request, the pick back on stdout -- with a different
+wire format. It runs `custom_picker_binary` with no arguments (`--allow-token` when
+`allow_token_by_default` is on), puts its window list in `XDPH_WINDOW_SHARING_LIST`, and reads one
+line back:
+
+```
+[SELECTION]r/screen:viewfinder
+```
+
+`screen:<output>`, `window:<handle>` or `region:<output>@x,y,w,h`; an `r` before the slash asks
+for a restore token. The chooser recognises the environment variable and answers this way. It
+always answers with the sink, because xdph does not tell its picker what kinds of source the
+request will take, and it asks for the token when xdph offered one, so that an app's second session
+is answered without the picker running again.
+
+```ini
+# ~/.config/hypr/xdph.conf
+screencopy {
+    custom_picker_binary = /absolute/path/to/wl-viewfinder-picker
+}
+```
+
+The binary is executed directly, not through a shell, so a subcommand cannot be given there: the
+path has to be a wrapper. It also needs `hyprctl` on its PATH, which the tool does not carry for
+the same reason it does not carry sway:
+
+```sh
+#!/usr/bin/env bash
+PATH=/path/to/hyprland/bin:$PATH
+exec /absolute/path/to/wl-viewfinder chooser "$@"
+```
+
+Then `systemctl --user restart xdg-desktop-portal-hyprland`. xdph looks its outputs up after the
+picker has returned, so a viewfinder created by the request should be pickable -- arming first, as
+for xdpw, costs nothing and removes the doubt.
+
+To try it by hand:
+
+```sh
+XDPH_WINDOW_SHARING_LIST= wl-viewfinder chooser --allow-token
+```
 
 ## Debugging
 
