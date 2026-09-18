@@ -350,10 +350,11 @@ sway_drop_sink() {
 # by a workspace rule set before the output exists, which is what stops the new output eating the
 # next free workspace number -- renaming would not do, a renamed workspace keeps its number.
 #
-# Hyprland has two config languages since 0.55, and `hyprctl` speaks whichever the running config
-# is written in: `keyword` and the classic dispatchers under hyprlang, `eval` and `hl.*` under Lua.
-# Everything that writes to the compositor goes through hypr_config / hypr_dispatch, which carry
-# both spellings. Reads are `hyprctl -j`, which is the same in both.
+# Writes go through `hyprctl eval` and `hyprctl dispatch` in the Lua config API, which Hyprland
+# has since 0.55 and which this was written against at 0.56. A Hyprland still on hyprland.conf
+# runs the legacy config manager, whose hyprctl speaks `keyword` and the classic dispatchers
+# instead; that is not carried, and the sink refuses to be built with a message saying so. Reads
+# are `hyprctl -j`, which is the same either way.
 #
 # The sink is placed at a large *negative* x. Hyprland lays its outputs out afresh on every change:
 # explicitly positioned ones first, then `auto` ones to the right of everything placed so far. A
@@ -362,37 +363,14 @@ sway_drop_sink() {
 # price is a share whose region reads `-30000,0`, which wl-mirror parses through strtoul and gets
 # right by wrapping. Only `auto-left` and `auto-up` layouts see the sink at all.
 
-hypr_lua_cached=""
+# Never fails -- the caller checks the result it cares about instead.
+hypr_eval() { hyprctl eval "$1" > /dev/null 2>&1 || true; }
+hypr_dispatch() { hyprctl dispatch "$1" > /dev/null 2>&1 || true; }
+
+# `eval` exists only under the Lua config; hyprlang and older versions answer with an error.
 hypr_lua() {
-  if [ -z "$hypr_lua_cached" ]; then
-    # `eval` exists only under the Lua config; hyprlang and older versions answer with an error.
-    if [ "$(hyprctl eval 'return 1' 2>/dev/null)" = ok ]; then
-      hypr_lua_cached=yes
-    else
-      hypr_lua_cached=no
-    fi
-  fi
-  [ "$hypr_lua_cached" = yes ]
-}
-
-# One write to the compositor, in whichever language it speaks: $1 is the Lua statement, $2 and
-# $3 the hyprlang keyword and its value. Never fails -- the caller checks the result it cares
-# about instead.
-hypr_config() {
-  if hypr_lua; then
-    hyprctl eval "$1" > /dev/null 2>&1 || true
-  else
-    hyprctl keyword "$2" "$3" > /dev/null 2>&1 || true
-  fi
-}
-
-# Likewise for a dispatcher: $1 the Lua call, $2 the classic dispatcher with its argument.
-hypr_dispatch() {
-  if hypr_lua; then
-    hyprctl dispatch "$1" > /dev/null 2>&1 || true
-  else
-    hyprctl dispatch "$2" > /dev/null 2>&1 || true
-  fi
+  [ "$(hyprctl eval 'return 1' 2>/dev/null)" = ok ] ||
+    { echo "wl-viewfinder: Hyprland is not running a Lua config (hyprland.lua), which the sink needs" >&2; return 1; }
 }
 
 hypr_focused_window() {
@@ -487,13 +465,12 @@ hypr_new_headless() {
     *@*) ;;
     *) mode="$mode@60" ;;
   esac
+  hypr_lua || return 1
   # Rules first, output second: both are read when the output appears. The monitor rule is what
   # gives it a mode and a place; the workspace rule is what makes its first workspace the named
   # one rather than the next free number, and what brings that workspace back to it if it exists.
-  hypr_config "hl.monitor({ output = \"$ws\", mode = \"$mode\", position = \"${x}x0\", scale = \"1\" })" \
-    monitor "$ws,$mode,${x}x0,1"
-  hypr_config "hl.workspace_rule({ workspace = \"name:$ws\", monitor = \"$ws\", default = true })" \
-    workspace "name:$ws, monitor:$ws, default:true"
+  hypr_eval "hl.monitor({ output = \"$ws\", mode = \"$mode\", position = \"${x}x0\", scale = \"1\" })"
+  hypr_eval "hl.workspace_rule({ workspace = \"name:$ws\", monitor = \"$ws\", default = true })"
   hyprctl output create headless "$ws" > /dev/null 2>&1 || return 1
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     [ -z "$(hypr_output_present "$ws")" ] || break
@@ -512,19 +489,11 @@ hypr_blank_region() {
 # The analogue of sway's assign: a static window rule is applied as the window opens, which is
 # the only placement early enough to beat wl-mirror's own fullscreen request (see sway above).
 # It names the workspace, and the workspace rule above binds that to the sink. Bound to the
-# title as well as the class, so no other wl-mirror is ever swept up by it. Under Lua the rule is
-# named, so re-asserting it replaces rather than accumulates; under hyprlang it accumulates until
-# the config is reloaded, which is harmless -- every copy says the same thing.
+# title as well as the class, so no other wl-mirror is ever swept up by it, and named, so
+# re-asserting it replaces the rule rather than adding another.
 hypr_assign_mirror() {
   local class='^(at\.yrlf\.wl_mirror)$' title="^($mirror_title)\$"
-  if hypr_lua; then
-    hyprctl eval "hl.window_rule({ name = \"wl-viewfinder\", match = { class = [[$class]], title = [[$title]] }, workspace = \"name:$sink_workspace silent\", fullscreen = true })" \
-      > /dev/null 2>&1 || true
-  elif [ "$(hyprctl keyword windowrule "workspace name:$sink_workspace silent, fullscreen true, match:class $class, match:title $title" 2>/dev/null)" != ok ]; then
-    # Before 0.56 the same rule was spelled windowrulev2, one effect per line.
-    hyprctl keyword windowrulev2 "workspace name:$sink_workspace silent, class:$class, title:$title" > /dev/null 2>&1 || true
-    hyprctl keyword windowrulev2 "fullscreen, class:$class, title:$title" > /dev/null 2>&1 || true
-  fi
+  hypr_eval "hl.window_rule({ name = \"wl-viewfinder\", match = { class = [[$class]], title = [[$title]] }, workspace = \"name:$sink_workspace silent\", fullscreen = true })"
 }
 
 hypr_focus_mark() {
@@ -543,11 +512,11 @@ hypr_focus_restore() {
   case ${1:-} in
     "con "*)
       [ "$(hyprctl -j activewindow | jq -r '.address // empty')" != "${1#con }" ] || return 0
-      hypr_dispatch "hl.dsp.focus({ window = \"address:${1#con }\" })" "focuswindow address:${1#con }"
+      hypr_dispatch "hl.dsp.focus({ window = \"address:${1#con }\" })"
       ;;
     "ws "*)
       [ -n "$(hyprctl -j activewindow | jq -r '.address // empty')" ] || return 0
-      hypr_dispatch "hl.dsp.focus({ workspace = \"${1#ws }\" })" "workspace ${1#ws }"
+      hypr_dispatch "hl.dsp.focus({ workspace = \"${1#ws }\" })"
       ;;
   esac
 }
@@ -559,7 +528,7 @@ hypr_fullscreen() {
 }
 
 hypr_park_mirror() {
-  local name=$1 id selector ws focus
+  local name=$1 id selector ws
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     id=$(hypr_mirror_address)
     [ -z "$id" ] || break
@@ -569,22 +538,10 @@ hypr_park_mirror() {
   read -r selector ws < <(hypr_active_workspace_of_output "$name") || true
   [ -n "${selector:-}" ] || return 1
   # Onto whatever the sink is showing, which is the only workspace of it that renders.
-  if [ "$(hypr_workspace_of_id "$id")" != "$ws" ]; then
-    hypr_dispatch "hl.dsp.window.move({ window = \"address:$id\", workspace = \"$selector\", follow = false })" \
-      "movetoworkspacesilent $selector,address:$id"
-  fi
-  hypr_fullscreen "$id" && return 0
-  if hypr_lua; then
-    hyprctl dispatch "hl.dsp.window.fullscreen({ window = \"address:$id\", action = \"set\", mode = \"fullscreen\" })" \
-      > /dev/null 2>&1 || true
-  else
-    # The classic dispatcher only fullscreens the focused window, so the focus goes there and
-    # straight back, in one batch: nothing is rendered in between, and the pointer never lands on
-    # the sink.
-    focus=$(hyprctl -j activewindow | jq -r '.address // empty')
-    hyprctl --batch "dispatch focuswindow address:$id; dispatch fullscreen 0${focus:+; dispatch focuswindow address:$focus}" \
-      > /dev/null 2>&1 || true
-  fi
+  [ "$(hypr_workspace_of_id "$id")" = "$ws" ] ||
+    hypr_dispatch "hl.dsp.window.move({ window = \"address:$id\", workspace = \"$selector\", follow = false })"
+  hypr_fullscreen "$id" ||
+    hypr_dispatch "hl.dsp.window.fullscreen({ window = \"address:$id\", action = \"set\", mode = \"fullscreen\" })"
 }
 
 hypr_drop_sink() {

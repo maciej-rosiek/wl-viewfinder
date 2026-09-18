@@ -178,9 +178,11 @@ Hyprland, river, Wayfire, COSMIC, labwc. GNOME and KDE implement neither and can
 **Hyprland** have one. Everything that knows which compositor this is lives in one marked block of
 the script, one set of functions per compositor -- see [porting](docs/internals.md#porting).
 
-The Hyprland backend is written against Hyprland 0.56 and works under either of its config
-languages, hyprlang and Lua. It has been checked against Hyprland's source and a scripted
-`hyprctl`, not yet against a running Hyprland, so treat the first share as the test.
+The Hyprland backend is written against Hyprland 0.56 and drives it through the Lua config API
+(`hyprctl eval`, `hl.*`), so it needs a Hyprland running `hyprland.lua` -- 0.55 or later, and not
+the legacy `hyprland.conf`, under which `hyprctl` speaks a different language and the sink refuses
+to be built. It has been checked against Hyprland's source and a scripted `hyprctl`, not yet
+against a running Hyprland, so treat the first share as the test.
 
 ## Dependencies
 

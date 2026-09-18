@@ -66,9 +66,7 @@ as the window opens; a workspace rule binding `name:viewfinder` to the `viewfind
 before the output exists, is what makes that workspace the output's first one rather than the next
 free number -- renaming would not do, a renamed workspace keeps its number, and a numbered
 workspace on a headless output is a `$mod+n` that focuses a screen nobody can see. The by-hand
-fallback moves the window with `movetoworkspacesilent` and fullscreens it; under hyprlang the
-classic `fullscreen` dispatcher only acts on the focused window, so the focus goes there and back
-inside one `hyprctl --batch`, where nothing is rendered in between.
+fallback moves the window onto that workspace and fullscreens it by address, focus untouched.
 
 Hyprland's sink sits at a large *negative* x rather than a positive one. Hyprland re-lays its
 outputs out on every change, explicitly positioned ones first and `auto` ones to the right of
@@ -78,9 +76,9 @@ itself; one ending left of x=0 never enters that calculation. wl-mirror parses t
 
 Since 0.55 Hyprland has two config languages, and `hyprctl` speaks whichever the running config is
 written in: `keyword` plus the classic dispatchers under hyprlang, `eval` plus `hl.*` under Lua.
-The backend probes once with `hyprctl eval` and carries both spellings of every write. Reads are
-`hyprctl -j`, which is the same in both. Under hyprlang before 0.56 the window rule falls back to
-the `windowrulev2` spelling.
+The backend writes in Lua only -- every rule and dispatcher has exactly one spelling -- and probes
+with `hyprctl eval` before building the sink, so a Hyprland on `hyprland.conf` gets one line saying
+why rather than a half-built sink. Reads are `hyprctl -j`, which is the same in both.
 
 ## Knowing that the call has ended
 
@@ -148,8 +146,8 @@ simply polls. A compositor with a real geometry-changed event should drive it fr
 The Hyprland backend has been checked against Hyprland's source and a scripted `hyprctl`, not
 against a running Hyprland. What to watch on a first run: the sink appearing at `-30000,0` in
 `hyprctl monitors` with `viewfinder` as its workspace and no numbered workspace on it, the mirror
-landing there fullscreen without the focus moving, and `hyprctl reload` -- under hyprlang it drops
-every rule set at runtime, sink placement included, so re-arm after one.
+landing there fullscreen without the focus moving, and `hyprctl reload` -- it rebuilds the Lua
+state and with it drops every rule set at runtime, sink placement included, so re-arm after one.
 
 ## Notes
 
